@@ -366,19 +366,30 @@ namespace Studies.MarketResilience.Model
             // COMPONENT 0: TRADE SHOCK SEVERITY (30% weight)
             // ───────────────────────────────────────────────────────────────
             const double W_TRADE = 0.3;
+
+            // Dispersion must be measurable RELATIVE to the mean for a z-score to mean anything.
+            // The factor is dimensionless on purpose: it carries no unit, no tick size and no lot
+            // size, so it reads the same for a fraction of a coin and for a hundred shares.
+            const decimal REL_EPS = 1e-6m;
+
             if (ShockTrade != null && recentTradeSizes.Any())
             {
                 decimal avgSize = recentTradeSizes.Average();
                 decimal stdSize = recentTradeSizes.StandardDeviation();
 
-                if (stdSize > 0)
+                // No scale to measure against, or a dispersion too small relative to that scale, and
+                // the z-score carries no information about the shock print. Leave the component out
+                // of the weighting entirely rather than publish a fabricated value at 30% weight.
+                if (avgSize > 0 && stdSize >= REL_EPS * avgSize)
                 {
                     // Z-score of trade size (how many std devs above mean)
                     double tradeZ = (double)((ShockTrade.Value - avgSize) / stdSize);
 
                     // Convert to resilience score (0..1)
                     // z=3 → score=0.5, z=6 → score=0
-                    double tradeScore = Math.Max(0, 1.0 - (tradeZ / 6.0));
+                    // Clamped at BOTH ends, like every other component: a negative z-score would
+                    // otherwise push this above 1 and carry the published score out of range.
+                    double tradeScore = Math.Clamp(1.0 - (tradeZ / 6.0), 0.0, 1.0);
 
                     weightedScore += W_TRADE * tradeScore;
                     totalWeight += W_TRADE;
@@ -397,14 +408,24 @@ namespace Studies.MarketResilience.Model
                     ? spreadRecoveryTimes.Average()
                     : spreadRecoveryDurationMs;
 
-                double spreadRecoveryScore = avgSpreadHistoricalRecoveryMs /
-                    (avgSpreadHistoricalRecoveryMs + spreadRecoveryDurationMs);
-                spreadRecoveryScore = Math.Max(0, Math.Min(1, spreadRecoveryScore));
+                // A zero denominator means an instantaneous recovery with nothing to compare it
+                // to. That is an absence of evidence, not a perfect recovery and not a failed one,
+                // so the component is omitted and the normalisation below reweights what remains.
+                double spreadRecoveryDenominatorMs = avgSpreadHistoricalRecoveryMs + spreadRecoveryDurationMs;
+                if (spreadRecoveryDenominatorMs > 0.0)
+                {
+                    double spreadRecoveryScore = Math.Clamp(
+                        avgSpreadHistoricalRecoveryMs / spreadRecoveryDenominatorMs, 0.0, 1.0);
 
-                weightedScore += W_SPREAD * spreadRecoveryScore;
-                totalWeight += W_SPREAD;
+                    weightedScore += W_SPREAD * spreadRecoveryScore;
+                    totalWeight += W_SPREAD;
+                }
 
-                spreadRecoveryTimes.Add(spreadRecoveryDurationMs);  // ✅ Only add real data
+                // Only a measured recovery joins the history. A zero sample would pull the
+                // historical baseline down, and that baseline is the numerator above, so every
+                // later genuine recovery would score lower for the rest of the session.
+                if (spreadRecoveryDurationMs > 0.0)
+                    spreadRecoveryTimes.Add(spreadRecoveryDurationMs);
             }
 
             // ───────────────────────────────────────────────────────────────
@@ -419,14 +440,20 @@ namespace Studies.MarketResilience.Model
                     ? depletionRecoveryTimes.Average()
                     : depletionRecoveryDurationMs;
 
-                double depletionRecoveryScore = avgDepletionHistoricalRecoveryMs /
-                    (avgDepletionHistoricalRecoveryMs + depletionRecoveryDurationMs);
-                depletionRecoveryScore = Math.Max(0, Math.Min(1, depletionRecoveryScore));
+                // Same rule as the spread component above: a zero denominator is no evidence, so
+                // the component is omitted rather than scored with an invented value at 50% weight.
+                double depletionRecoveryDenominatorMs = avgDepletionHistoricalRecoveryMs + depletionRecoveryDurationMs;
+                if (depletionRecoveryDenominatorMs > 0.0)
+                {
+                    double depletionRecoveryScore = Math.Clamp(
+                        avgDepletionHistoricalRecoveryMs / depletionRecoveryDenominatorMs, 0.0, 1.0);
 
-                weightedScore += W_DEPTH * depletionRecoveryScore;
-                totalWeight += W_DEPTH;
+                    weightedScore += W_DEPTH * depletionRecoveryScore;
+                    totalWeight += W_DEPTH;
+                }
 
-                depletionRecoveryTimes.Add(depletionRecoveryDurationMs);  // ✅ Only add real data
+                if (depletionRecoveryDurationMs > 0.0)
+                    depletionRecoveryTimes.Add(depletionRecoveryDurationMs);
             }
 
             // ───────────────────────────────────────────────────────────────
@@ -451,17 +478,23 @@ namespace Studies.MarketResilience.Model
             // ───────────────────────────────────────────────────────────────
             // FINAL SCORE NORMALIZATION
             // ───────────────────────────────────────────────────────────────
-            // ✅ KEY CHANGE: Normalize by actual total weight
-            // This ensures score is always in [0, 1] regardless of missing components
+            // The published score is the weighted average over the components that actually had
+            // usable evidence, so an omitted component reweights the rest instead of skewing the
+            // result. The clamp bounds the value to [0, 1]; the finiteness check is what keeps the
+            // cast safe, because a non-finite quotient survives a clamp untouched and then throws
+            // on conversion to decimal.
+            //
+            // A cycle that produced no usable evidence at all publishes NOTHING: the last score
+            // stands until something is actually measured. Substituting a stand-in would state
+            // something the data does not support, and the only stand-in available here is the top
+            // of the scale - the worst possible reading to emit during a depletion, which is one of
+            // the ways a cycle ends up with no evidence in the first place.
 
             if (totalWeight > 0)
             {
-                CurrentMRScore = (decimal)(weightedScore / totalWeight);
-            }
-            else
-            {
-                // Fallback: no evidence = baseline resilience
-                CurrentMRScore = 1.0m;
+                double normalizedScore = weightedScore / totalWeight;
+                if (double.IsFinite(normalizedScore))
+                    CurrentMRScore = (decimal)Math.Clamp(normalizedScore, 0.0, 1.0);
             }
 
             // ───────────────────────────────────────────────────────────────

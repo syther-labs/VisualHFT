@@ -61,12 +61,23 @@ namespace VisualHFT.Helpers
                 }
                 catch (Exception ex)
                 {
+                    // This runs on the market connector's producer thread, at a call site that
+                    // does not guard itself. An unhandled exception on a non-UI thread
+                    // terminates the process, and an escaping exception would also unwind this
+                    // loop, so one faulting subscriber would starve every subscriber after it
+                    // of order-book data.
+                    //
+                    // A study plugin throwing is a normal operating condition on a hot path, not
+                    // grounds for killing the host. Each subscriber is isolated and dispatch
+                    // continues to the next. Isolating must not mean hiding a data outage, so the
+                    // fault is logged and published on OnException, carrying the subscriber that
+                    // raised it so a listener can tell whose fault it was.
                     Task.Run(() =>
                     {
                         log.Error(ex);
                         OnException?.Invoke(new VisualHFT.Commons.Model.ErrorEventArgs(ex, subscriber.Target));
                     });
-                    throw;
+                    // deliberately NO rethrow — continue to the next subscriber.
                 }
             }
         }

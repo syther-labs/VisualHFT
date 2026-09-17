@@ -84,7 +84,10 @@ namespace VisualHFT.Commons.PluginManager
                 throw new InvalidOperationException($"{Name} plugin settings has not been loaded.");
             HelperProvider.Instance.OnStatusChanged += Provider_OnStatusChanged;
             HelperProvider.Instance.OnProviderStale += Provider_OnProviderStale; //when no data for 30 seconds is received.
-            HelperOrderBook.Instance.OnException += HelperOrderBookInstance_OnException;//subscribe and hear for exceptions on this Plugin
+            // Both market-data streams report a faulting subscriber the same way, and a fault on
+            // either one is fatal to this plugin, so both are heard here.
+            HelperOrderBook.Instance.OnException += MarketDataHelper_OnException;
+            HelperTrade.Instance.OnException += MarketDataHelper_OnException;
             Status = ePluginStatus.LOADED;
         }
 
@@ -229,7 +232,7 @@ namespace VisualHFT.Commons.PluginManager
             HelperNotificationManager.Instance.AddNotification(this.Name, msg, HelprNorificationManagerTypes.ERROR, HelprNorificationManagerCategories.PLUGINS);
         }
 
-        private void HelperOrderBookInstance_OnException(Model.ErrorEventArgs obj)
+        private void MarketDataHelper_OnException(Model.ErrorEventArgs obj)
         {
             if (obj.Context is BasePluginStudy study && study == this)
             {
@@ -375,7 +378,8 @@ namespace VisualHFT.Commons.PluginManager
                 _disposed = true;
                 HelperProvider.Instance.OnStatusChanged -= Provider_OnStatusChanged;
                 HelperProvider.Instance.OnProviderStale -= Provider_OnProviderStale;
-                HelperOrderBook.Instance.OnException -= HelperOrderBookInstance_OnException; ; //subscribe and hear for exceptions on this Plugin
+                HelperOrderBook.Instance.OnException -= MarketDataHelper_OnException;
+                HelperTrade.Instance.OnException -= MarketDataHelper_OnException;
 
                 _QUEUE?.Dispose();
                 _AGG_DATA?.Dispose();
