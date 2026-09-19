@@ -23,6 +23,7 @@ namespace VisualHFT.Studies
 
         private double _lobImbalance = 0;
         private double _lobMidPrice = 0;
+        private P2Quantile _spreadMedian = new P2Quantile(0.5);
 
         // Event declaration
         public override event EventHandler<decimal> OnAlertTriggered;
@@ -37,9 +38,9 @@ namespace VisualHFT.Studies
         public override ISetting Settings { get => _settings; set => _settings = (PlugInSettings)value; }
         public override Action CloseSettingWindow { get; set; }
         public override string TileTitle { get; set; } = "LOB Imbalance";
-        public override string TileToolTip { get; set; } = "The <b>Limit Order Book Imbalance</b> represents the disparity between buy and sell orders at a specific price level.<br/><br/>" +
-                "It highlights the difference in demand and supply in the order book, providing insights into potential price movements.<br/>" +
-                "A significant imbalance can indicate a strong buying or selling interest at that price.";
+        public override string TileToolTip { get; set; } = "The <b>Limit Order Book Imbalance</b> compares total bid size to total ask size across the price levels your data feed captures (set by the connector's Depth Levels setting) - not just the best price.<br/><br/>" +
+                "Depending on the <b>Weighting</b> setting below, every captured level counts equally, or levels farther from the best price count less.<br/>" +
+                "A significant imbalance can indicate a strong buying or selling interest across that captured depth.";
 
         public LOBImbalanceStudy()
         { }
@@ -51,6 +52,12 @@ namespace VisualHFT.Studies
         public override async Task StartAsync()
         {
             await base.StartAsync();//call the base first
+
+            // Fresh on every start: HandleRestart() (settings save, e.g. a Symbol/Provider change)
+            // calls StopAsync()/StartAsync() on this SAME instance. A stale median from the old
+            // instrument's spread scale would silently degenerate touch weighting on the new one -
+            // mirrors MarketResilienceStudy.StartAsync() recreating its calculator the same way.
+            _spreadMedian = new P2Quantile(0.5);
 
             HelperOrderBook.Instance.Subscribe(LIMITORDERBOOK_OnDataReceived);
 
@@ -85,8 +92,14 @@ namespace VisualHFT.Studies
             if (_settings.Provider.ProviderID != e.ProviderID || _settings.Symbol != e.Symbol)
                 return;
 
-            e.CalculateMetrics();
-            _lobImbalance = e.ImbalanceValue;
+            // Computed locally, never through OrderBook.CalculateMetrics()/ImbalanceValue: that
+            // state is shared across every subscriber of this book, so a per-study weighting mode
+            // cannot be honoured there without corrupting the value other consumers depend on.
+            double currentSpread = e.Spread;
+            _spreadMedian.Observe(currentSpread);
+            double spreadScale = SpreadScaleResolver.Resolve(e.PriceDecimalPlaces, currentSpread, _spreadMedian.Count, _spreadMedian.Estimate);
+
+            _lobImbalance = ImbalanceCalculator.Calculate(e.Bids, e.Asks, e.MaxDepth, _settings.Weighting, spreadScale);
             _lobMidPrice = e.MidPrice;
             DoCalculationAndSend();
         }
@@ -162,7 +175,8 @@ namespace VisualHFT.Studies
             {
                 Symbol = "",
                 Provider = new Provider(),
-                AggregationLevel = AggregationLevel.Ms100
+                AggregationLevel = AggregationLevel.Ms100,
+                Weighting = ImbalanceWeighting.EqualWeight
             };
             SaveToUserSettings(_settings);
         }
@@ -173,12 +187,14 @@ namespace VisualHFT.Studies
             viewModel.SelectedSymbol = _settings.Symbol;
             viewModel.SelectedProviderID = _settings.Provider.ProviderID;
             viewModel.AggregationLevelSelection = _settings.AggregationLevel;
+            viewModel.WeightingSelection = _settings.Weighting;
 
             viewModel.UpdateSettingsFromUI = () =>
             {
                 _settings.Symbol = viewModel.SelectedSymbol;
                 _settings.Provider = viewModel.SelectedProvider;
                 _settings.AggregationLevel = viewModel.AggregationLevelSelection;
+                _settings.Weighting = viewModel.WeightingSelection;
 
                 SaveSettings();
 

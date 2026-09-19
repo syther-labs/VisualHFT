@@ -19,6 +19,7 @@ namespace VisualHFT.Studies.LOBImbalance.ViewModel
         private int? _selectedProviderID;
         private string _selectedSymbol;
         private AggregationLevel _aggregationLevelSelection;
+        private Model.ImbalanceWeighting _weightingSelection;
 
 
         private string _validationMessage;
@@ -48,6 +49,13 @@ namespace VisualHFT.Studies.LOBImbalance.ViewModel
             {
                 AggregationLevels.Add(new Tuple<string, AggregationLevel>(Commons.Helpers.HelperCommon.GetEnumDescription(level), level));
             }
+
+            Weightings = new ObservableCollection<Tuple<string, Model.ImbalanceWeighting>>();
+            foreach (Model.ImbalanceWeighting weighting in Enum.GetValues(typeof(Model.ImbalanceWeighting)))
+            {
+                Weightings.Add(new Tuple<string, Model.ImbalanceWeighting>(Commons.Helpers.HelperCommon.GetEnumDescription(weighting), weighting));
+            }
+
             LoadSelectedProviderID();
         }
 
@@ -99,6 +107,18 @@ namespace VisualHFT.Studies.LOBImbalance.ViewModel
             }
         }
         public ObservableCollection<Tuple<string, AggregationLevel>> AggregationLevels { get; set; }
+
+        public Model.ImbalanceWeighting WeightingSelection
+        {
+            get => _weightingSelection;
+            set
+            {
+                _weightingSelection = value;
+                RaiseCanExecuteChanged();
+                OnPropertyChanged(nameof(WeightingSelection));
+            }
+        }
+        public ObservableCollection<Tuple<string, Model.ImbalanceWeighting>> Weightings { get; set; }
 
 
         public string ValidationMessage

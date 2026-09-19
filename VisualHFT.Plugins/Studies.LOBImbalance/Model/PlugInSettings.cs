@@ -9,5 +9,6 @@ namespace VisualHFT.Studies.LOBImbalance.Model
         public string Symbol { get; set; }
         public Provider Provider { get; set; }
         public AggregationLevel AggregationLevel { get; set; }
+        public ImbalanceWeighting Weighting { get; set; }
     }
 }
