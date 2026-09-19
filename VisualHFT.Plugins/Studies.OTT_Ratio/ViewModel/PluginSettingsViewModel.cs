@@ -19,6 +19,7 @@ namespace VisualHFT.Studies.MarketRatios.ViewModel
         private int? _selectedProviderID;
         private string _selectedSymbol;
         private AggregationLevel _aggregationLevelSelection;
+        private bool _useVolumeFormSelection;
 
 
         private string _validationMessage;
@@ -100,6 +101,20 @@ namespace VisualHFT.Studies.MarketRatios.ViewModel
             }
         }
         public ObservableCollection<Tuple<string, AggregationLevel>> AggregationLevels { get; set; }
+
+        /// <summary>
+        /// Selects the volume form of the ratio instead of the message-count form.
+        /// </summary>
+        public bool UseVolumeFormSelection
+        {
+            get => _useVolumeFormSelection;
+            set
+            {
+                _useVolumeFormSelection = value;
+                RaiseCanExecuteChanged();
+                OnPropertyChanged(nameof(UseVolumeFormSelection));
+            }
+        }
 
 
         public string ValidationMessage
