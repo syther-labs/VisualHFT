@@ -41,7 +41,7 @@ namespace MarketConnectors.Binance
         private BinanceRestClient _restClient;
         
         // ✅ FIX: Use ConcurrentDictionary for thread safety
-        private readonly ConcurrentDictionary<string, VisualHFT.Model.OrderBook> _localOrderBooks = 
+        internal readonly ConcurrentDictionary<string, VisualHFT.Model.OrderBook> _localOrderBooks = 
             new ConcurrentDictionary<string, VisualHFT.Model.OrderBook>();
         
         private HelperCustomQueue<IBinanceEventOrderBook> _eventBuffers;
@@ -577,7 +577,7 @@ namespace MarketConnectors.Binance
             Task.Run(async () => await HandleConnectionLost(_error, ex));
         }
 
-        private void tradesBuffers_onReadAction(IBinanceTrade eventData)
+        internal void tradesBuffers_onReadAction(IBinanceTrade eventData)
         {
             var _symbol = GetNormalizedSymbol(eventData.Symbol);
             // Get a Trade object from the pool.
@@ -589,7 +589,11 @@ namespace MarketConnectors.Binance
             trade.Timestamp = eventData.TradeTime.ToLocalTime();
             trade.ProviderId = _settings.Provider.ProviderID;
             trade.ProviderName = _settings.Provider.ProviderName;
-            trade.IsBuy = eventData.BuyerIsMaker;
+            // IsBuy means the AGGRESSOR bought. The stream reports the opposite fact: BuyerIsMaker is
+            // the "m" flag, true when the buyer was the resting maker - which makes the seller the
+            // aggressor. Negate it, or every aggressive sell on this venue is reported as a buy and
+            // every study that reads trade side reads this venue backwards.
+            trade.IsBuy = !eventData.BuyerIsMaker;
             trade.MarketMidPrice = _localOrderBooks[_symbol].MidPrice;
 
             RaiseOnDataReceived(trade);

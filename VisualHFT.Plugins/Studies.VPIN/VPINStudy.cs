@@ -15,12 +15,25 @@ using VisualHFT.UserSettings;
 namespace VisualHFT.Studies
 {
     /// <summary>
-    /// VPIN (Volume-Synchronized Probability of Informed Trading) measures order flow toxicity
-    /// using volume-synchronized buckets per Easley, Lopez de Prado & O'Hara (2012).
+    /// VPIN (Volume-Synchronized Probability of Informed Trading), the volume-bucket order-flow
+    /// imbalance of Easley, Lopez de Prado and O'Hara (2012).
     ///
     /// Formula: VPIN = (1/n) * SUM |V_buy_i - V_sell_i| / V_bucket, over n completed buckets.
     ///
-    /// Range [0, 1]: 0 = balanced flow, 1 = fully toxic (all buys or all sells).
+    /// Range [0, 1]: 0 means every bucket in the window was balanced, 1 means every bucket was
+    /// one-sided. It is not a probability, despite the name the literature gave it.
+    ///
+    /// Two forms ship side by side, selected by <c>UseCorrectedForm</c>.
+    ///
+    /// The LEGACY form is the default so that a settings file written before the option existed
+    /// keeps the behaviour it already had. It classifies each print against the order-book mid
+    /// price, averages over however many buckets have closed so far rather than waiting for a full
+    /// window, and re-publishes on every order-book update. It accepts any positive bucket volume,
+    /// including one small enough to hold a single print, which on a whole-lot instrument pins the
+    /// reading at 1 permanently.
+    ///
+    /// The CORRECTED form is in <see cref="Model.VpinBucketEngine"/>, which documents the
+    /// construction and the one place it departs from the paper.
     /// </summary>
     public class VPINStudy : BasePluginStudy
     {
@@ -46,6 +59,17 @@ namespace VisualHFT.Studies
         private int _bufferCount = 0;
         private decimal _rollingSum = 0; // Running sum for O(1) average calculation
 
+        // Which form is selected, read once per reset. The legacy path is gated on THIS and never on
+        // the engine being non-null: a corrected-form user whose bucket volume is unusable must get
+        // nothing, not a silent fall-back to the other form's number under the other form's rules.
+        private bool _useCorrectedForm;
+
+        // Corrected form only. Owns the whole calculation, so none of the legacy fields above are
+        // touched while it is running. Null when the legacy form is selected, and also when the
+        // corrected form is selected but cannot be armed - see ResetBucket.
+        private VpinBucketEngine? _engine;
+        private bool _floorWarningLogged;
+
 
         // Event declaration
         public override event EventHandler<decimal> OnAlertTriggered;
@@ -55,17 +79,27 @@ namespace VisualHFT.Studies
 
         public override string Name { get; set; } = "VPIN Study Plugin";
         public override string Version { get; set; } = "1.0.0";
+        // 🛑 DO NOT EDIT Name, Author, Version or Description. BasePluginStudy.GetPluginUniqueID()
+        // hashes all four together with the assembly name, and that hash is the key this plugin's
+        // saved settings are stored under AND the key every emitted metric is registered with. Change
+        // any of them and an existing installation stops finding its own settings - it falls back to
+        // defaults with an empty symbol and provider, so the tile goes dead rather than merely resetting
+        // - and every alert rule already built on this study stops matching, silently. The text a user
+        // actually reads is TileTitle and TileToolTip below, neither of which is hashed; correct those
+        // instead. Editing these four requires overriding GetPluginUniqueID() first to pin the existing
+        // key, which is a separate change with its own regression test.
         public override string Description { get; set; } = "Volume-Synchronized Probability of Informed Trading (VPIN) measures buy/sell volume imbalance in fixed buckets. Provides real-time risk assessment (0-1 scale) for market instability detection.";
         public override string Author { get; set; } = "VisualHFT";
         public override ISetting Settings { get => _settings; set => _settings = (PlugInSettings)value; }
         public override Action CloseSettingWindow { get; set; }
         public override string TileTitle { get; set; } = "VPIN";
-        public override string TileToolTip { get; set; } = "<b>Volume-Synchronized Probability of Informed Trading</b> (VPIN) is a real-time metric that measures the imbalance between buy and sell volumes, reflecting potential market risk or instability. <br/>VPIN is crucial for traders and analysts to gauge market sentiment and anticipate liquidity and volatility shifts.<br/><br/>" +
-                "VPIN is calculated through the accumulation of trade volumes into fixed-size buckets. Each bucket captures a snapshot of trading activity, enabling ongoing analysis of market dynamics:<br/>" +
-                "1. <b>Trade Classification:</b> Trades are categorized as buys or sells based on their relation to the market mid-price at execution.<br/>" +
-                "2. <b>Volume Accumulation:</b> Buy and sell volumes are accumulated separately until reaching a pre-set bucket size.<br/>" +
-                "3. <b>VPIN Calculation:</b> VPIN is the absolute difference between buy and sell volumes in a bucket, normalized to total volume, ranging from 0 (balanced trading) to 1 (high imbalance).<br/><br/>" +
-                "To enhance real-time relevance, VPIN values are updated with 'Interim Updates' during the filling of each bucket, providing a more current view of market conditions. These updates offer a dynamic and timely insight into market liquidity and informed trading activity. VPIN serves as an early warning indicator of market turbulence, particularly valuable in high-frequency trading environments.";
+        public override string TileToolTip { get; set; } = "<b>VPIN</b> (Volume-Synchronized Probability of Informed Trading) measures order-flow imbalance on a volume clock. Trades are grouped into buckets of equal traded volume. For each bucket we take the volume bought by aggressors minus the volume sold by aggressors, and show the average absolute imbalance over the last n buckets. 0 means every bucket was balanced; 1 means every bucket was one-sided.<br/><br/>" +
+                "<b>It is not a probability, and it is not a warning signal.</b> Andersen and Bondarenko (2014, 2015) showed that the metric's forecasting record came from its original classifier tracking volatility rather than from informed trading. Read it as a description of how one-sided recent flow has been, not as a forecast.<br/><br/>" +
+                "<b>Bucket volume decides the number.</b> Small buckets read high on random flow by arithmetic alone: with four equally sized prints per bucket the average on coin-flip sides is 0.375, with two it is 0.500, and with one it is 1.000. Size the bucket from the instrument's daily volume - the paper divides average daily volume by the number of buckets - and aim for at least 20 trades per bucket.<br/><br/>" +
+                "<b>Corrected form</b> (optional, off by default)<br/>" +
+                "Classifies each trade by the tick rule - a print above the previous print is a buy, below is a sell, unchanged repeats the previous side - which Chakrabarty, Pascual and Shkilko (2015) found more accurate than the paper's own bulk classifier. The paper's method splits a bucket's volume fractionally between the two sides; assigning each whole print to one side can only produce buckets at least as one-sided, so expect this to read higher than a bulk-classified figure on the same tape. That follows from the two constructions - it is not a measurement, and no bulk classifier ships here to compare against. Compare ranks and percentiles rather than published absolute thresholds. No value is shown until a full window of buckets has closed, and none is shown while the bucket volume is too small to hold 20 trades.<br/><br/>" +
+                "<b>Legacy form</b> (default)<br/>" +
+                "Classifies each trade against the order-book mid price, starts averaging from the first completed bucket instead of waiting for a full window, and accepts any positive bucket volume. It is the default only so that an existing settings file keeps the behaviour it already had.";
 
         public decimal BucketVolumeSize => _bucketVolumeSize;
 
@@ -121,10 +155,19 @@ namespace VisualHFT.Studies
 
             lock (_lockBucket)
             {
+                if (_useCorrectedForm)
+                {
+                    // Null engine means the corrected form is selected but could not be armed. Publish
+                    // nothing at all rather than quietly running the other form's arithmetic.
+                    if (_engine != null)
+                        ProcessTradeCorrected(e);
+                    return;
+                }
+
                 if (_bucketVolumeSize == 0)
                     _bucketVolumeSize = (decimal)_settings.BucketVolSize;
 
-                // Tick rule: classify using mid-price from the order book
+                // Quote rule: classify using mid-price from the order book
                 // Price >= mid → buy (aggressor lifting the ask)
                 // Price <  mid → sell (aggressor hitting the bid)
                 // Fallback to provider's IsBuy if no mid-price yet
@@ -191,12 +234,76 @@ namespace VisualHFT.Studies
             lock (_lockBucket)
             {
                 _lastMarketMidPrice = (decimal)e.MidPrice;
+
+                // Corrected form: the book is read for the displayed mid price only. It never feeds
+                // the calculation and never triggers a publish, so the value can only move when a
+                // bucket closes - which is the only time the metric is defined to move. Leaving the
+                // publish here would also put this dispatcher and the trade dispatcher, which are
+                // independent and unsynchronized, in contention on every book update.
+                if (_useCorrectedForm)
+                    return;
+
                 DoCalculation(false); //Interim update -> Just to send update.
             }
         }
+
+        /// <summary>
+        /// Corrected form. Runs under the same lock as the legacy path and publishes only when a
+        /// bucket closes, and only once the value means what the tooltip says it means.
+        /// </summary>
+        private void ProcessTradeCorrected(Trade e)
+        {
+            // Caller must hold _lockBucket.
+            // The dispatchers run inline on the connector's producer thread, so a print already inside
+            // this callback keeps running after StopAsync has set the status and before it unsubscribes,
+            // and again on a restart between the subscribe and the status being set back. The legacy
+            // path drops those in DoCalculation; this one has to drop them here.
+            if (Status != VisualHFT.PluginManager.ePluginStatus.STARTED)
+                return;
+
+            _engine.AddTrade(e.Price, e.Size);
+
+            if (!_engine.BucketJustClosed)
+                return;
+
+            if (!_engine.HasPublishableValue)
+            {
+                WarnIfBucketSizeBelowFloor();
+                return;
+            }
+
+            var newItem = new BaseStudyModel();
+            newItem.Value = _engine.Value;
+            newItem.Format = ValueFormat;
+            newItem.Timestamp = HelperTimeProvider.Now;
+            newItem.MarketMidPrice = _lastMarketMidPrice;
+            newItem.ValueColor = colorGreen;
+            newItem.AddItemSkippingAggregation = true;
+
+            AddCalculation(newItem);
+        }
+
+        private void WarnIfBucketSizeBelowFloor()
+        {
+            // Caller must hold _lockBucket
+            if (_floorWarningLogged || !_engine.IsBucketSizeBelowFloor)
+                return;
+
+            _floorWarningLogged = true;
+            log.Warn(
+                $"{this.Name}: bucket volume size {_engine.BucketVolumeSize} is too small for {_settings.Symbol}. " +
+                $"The median trade size observed is {_engine.MedianPrintSize}, so a bucket holding " +
+                $"{_engine.MinimumPrintsPerBucket} trades needs at least {_engine.RequiredBucketVolumeSize}. " +
+                "Below that the reading measures the bucket size rather than the order flow, so no value is published.");
+        }
+        /// <summary>
+        /// Legacy form only. The corrected form owns its own publishing in
+        /// <see cref="ProcessTradeCorrected"/>, so this path is closed while the engine is running.
+        /// </summary>
         private void DoCalculation(bool isNewBucket)
         {
             // Caller must hold _lockBucket
+            if (_useCorrectedForm) return;
             if (Status != VisualHFT.PluginManager.ePluginStatus.STARTED) return;
             string valueColor = isNewBucket ? colorGreen : colorWhite;
 
@@ -246,6 +353,23 @@ namespace VisualHFT.Studies
                 _bufferIndex = 0;
                 _bufferCount = 0;
                 _rollingSum = 0;
+
+                // A form switch or a bucket-size change restarts the calculation from nothing:
+                // buckets collected under one classification rule or one bucket volume say nothing
+                // about the other, so carrying them across would blend two different measurements.
+                _floorWarningLogged = false;
+                _engine = null;
+                _useCorrectedForm = _settings?.UseCorrectedForm == true;
+                if (_useCorrectedForm)
+                {
+                    // The dialog rejects a non-positive bucket volume, but a settings file edited by
+                    // hand or written by an older build does not go through the dialog.
+                    if (_settings!.BucketVolSize > 0)
+                        _engine = new VpinBucketEngine((decimal)_settings.BucketVolSize, n);
+                    else
+                        log.Warn($"{this.Name}: the corrected form is selected but the bucket volume size is {_settings.BucketVolSize}. " +
+                                 "It must be greater than zero. No value will be published until it is set.");
+                }
             }
         }
         /// <summary>
@@ -326,6 +450,7 @@ namespace VisualHFT.Studies
             PluginSettingsViewModel viewModel = new PluginSettingsViewModel(CloseSettingWindow);
             viewModel.BucketVolumeSize = _settings.BucketVolSize;
             viewModel.NumberOfBuckets = _settings.NumberOfBuckets ?? DEFAULT_NUMBER_OF_BUCKETS;
+            viewModel.UseCorrectedFormSelection = _settings.UseCorrectedForm;
             viewModel.SelectedSymbol = _settings.Symbol;
             viewModel.SelectedProviderID = _settings.Provider.ProviderID;
             viewModel.AggregationLevelSelection = _settings.AggregationLevel;
@@ -334,6 +459,7 @@ namespace VisualHFT.Studies
             {
                 _settings.BucketVolSize = viewModel.BucketVolumeSize;
                 _settings.NumberOfBuckets = viewModel.NumberOfBuckets;
+                _settings.UseCorrectedForm = viewModel.UseCorrectedFormSelection;
                 _settings.Symbol = viewModel.SelectedSymbol;
                 _settings.Provider = viewModel.SelectedProvider;
                 _settings.AggregationLevel = viewModel.AggregationLevelSelection;

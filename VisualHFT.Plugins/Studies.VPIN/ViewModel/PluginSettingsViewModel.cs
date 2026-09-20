@@ -21,6 +21,7 @@ namespace VisualHFT.Studies.VPIN.ViewModel
         private int? _selectedProviderID;
         private string _selectedSymbol;
         private AggregationLevel _aggregationLevelSelection;
+        private bool _useCorrectedFormSelection;
 
 
         private string _validationMessage;
@@ -121,6 +122,21 @@ namespace VisualHFT.Studies.VPIN.ViewModel
             }
         }
         public ObservableCollection<Tuple<string, AggregationLevel>> AggregationLevels { get; set; }
+
+        /// <summary>
+        /// Selects the corrected form: tick-rule classification, a full window before any value
+        /// appears, and no value at all while the bucket volume is too small to hold enough trades.
+        /// </summary>
+        public bool UseCorrectedFormSelection
+        {
+            get => _useCorrectedFormSelection;
+            set
+            {
+                _useCorrectedFormSelection = value;
+                RaiseCanExecuteChanged();
+                OnPropertyChanged(nameof(UseCorrectedFormSelection));
+            }
+        }
 
 
         public string ValidationMessage
