@@ -98,6 +98,36 @@
             </StackPanel>
             <TextBox Text="{Binding NumberOfBuckets, ValidatesOnDataErrors=True}" Margin="0,5" />
 
+            <StackPanel Orientation="Horizontal" Margin="0,20,0,0">
+                <CheckBox x:Name="UseCorrectedFormCheckBox"
+                          Content="Use corrected form (tick rule, full window required)"
+                          IsChecked="{Binding UseCorrectedFormSelection, UpdateSourceTrigger=PropertyChanged}"
+                          VerticalAlignment="Center"/>
+                <TextBlock x:Name="CorrectedFormInfoIcon" Text="&#x2139;&#xFE0F;" Cursor="Hand" Margin="10 0 0 0" VerticalAlignment="Center">
+                    <TextBlock.ToolTip>
+                        <ToolTip MaxWidth="380">
+                            <StackPanel>
+                                <TextBlock TextWrapping="Wrap">
+                                    <Run FontWeight="Bold">Legacy form</Run> (default)<LineBreak/>
+                                    <Run>Classifies each trade against the order-book mid price, starts averaging from the first completed bucket instead of waiting for a full window, and accepts any positive bucket volume. It is the default only so that an existing settings file keeps the behaviour it already had.</Run>
+                                </TextBlock>
+                                <TextBlock TextWrapping="Wrap" Margin="0,10,0,0">
+                                    <Run FontWeight="Bold">Corrected form</Run><LineBreak/>
+                                    <Run>Classifies each trade by the tick rule - a print above the previous print is a buy, below is a sell, unchanged repeats the previous side - which Chakrabarty, Pascual and Shkilko (2015) found more accurate than the paper's own bulk classifier. The paper splits a bucket's volume fractionally between the two sides; assigning each whole print to one side can only produce buckets at least as one-sided, so expect this to read higher than a bulk-classified figure on the same tape. That follows from the two constructions and has not been measured here. Compare ranks and percentiles rather than published absolute thresholds.</Run>
+                                </TextBlock>
+                                <TextBlock TextWrapping="Wrap" Margin="0,10,0,0">
+                                    <Run FontWeight="Bold">The tile stays blank until the metric is defined.</Run><LineBreak/>
+                                    <Run>Nothing is shown until a full window of buckets has closed - Bucket Volume Size times Number of Buckets of traded volume, which at the paper's own sizing is roughly one trading day. Nothing is shown either while the bucket volume is too small to hold 20 trades, measured against the median trade size seen on this instrument; below that the reading measures the bucket size rather than the order flow. The log names the bucket volume the instrument calls for.</Run>
+                                </TextBlock>
+                                <TextBlock TextWrapping="Wrap" Margin="0,10,0,0">
+                                    <Run FontWeight="Bold">Switching form mid-session does not clear the tile.</Run><LineBreak/><Run>The buckets collected so far are discarded and the new form starts from nothing, but the study is not restarted and the last number the previous form published stays on the tile until the new form has one of its own. After switching to the corrected form that wait is a full window. Treat the displayed value as belonging to the old form until it visibly changes.</Run>
+                                </TextBlock>
+                            </StackPanel>
+                        </ToolTip>
+                    </TextBlock.ToolTip>
+                </TextBlock>
+            </StackPanel>
+
             <Label Content="Aggregation"  Visibility="Hidden"/>
             <ComboBox ItemsSource="{Binding AggregationLevels}" Margin="0,5"
                       Visibility="Hidden"
