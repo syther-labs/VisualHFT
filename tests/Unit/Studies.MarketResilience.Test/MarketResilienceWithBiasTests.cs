@@ -1,4 +1,5 @@
-﻿using VisualHFT.Model;
+using VisualHFT;
+using VisualHFT.Model;
 using Studies.MarketResilience.Model;
 using VisualHFT.Commons.Model;
 using VisualHFT.Studies.MarketResilience.Model;
@@ -10,9 +11,23 @@ namespace Studies.MarketResilience.Tests
     /// <summary>
     /// Tests for MarketResilienceWithBias class focusing on directional bias detection
     /// after depth depletion/recovery events.
+    ///
+    /// The rules these tests assert:
+    ///   * only the DEPLETED side counts. A depleted side that regains 90% of what it lost closes
+    ///     the event as a recovery; the other side growing is a price move, not resilience;
+    ///   * an event whose depleted side never comes back inside the window is scored as a
+    ///     non-recovery (depth 0 at its full weight), and the direction points away from the side
+    ///     that failed to redeploy: a bid that never came back is Bearish, an ask is Bullish;
+    ///   * the first scored recovery of a session seeds the recovery history and publishes
+    ///     nothing, so every test that reads a score first completes at least one recovery.
+    ///
+    /// Every recovery duration is driven through the shared time provider, so the numbers are
+    /// exact rather than whatever the machine happened to measure.
     /// </summary>
     public class MarketResilienceWithBiasTests
     {
+        private static readonly DateTime ClockStart = new DateTime(2024, 3, 1, 14, 31, 0, DateTimeKind.Local);
+
         private PlugInSettings _settings;
 
         public MarketResilienceWithBiasTests()
@@ -21,6 +36,14 @@ namespace Studies.MarketResilience.Tests
             {
                 MaxShockMsTimeout = 500,
             };
+        }
+
+        /// <summary>Pins the shared time provider; disposing restores wall time.</summary>
+        private sealed class FixedClock : IDisposable
+        {
+            public FixedClock() => HelperTimeProvider.SetFixedTime(ClockStart);
+            public void Advance(long milliseconds) => HelperTimeProvider.IncrementByMilliseconds(milliseconds);
+            public void Dispose() => HelperTimeProvider.ResetToSystemTime();
         }
 
         private OrderBookSnapshot BuildLOB((decimal px, double sz)[] asks, (decimal px, double sz)[] bids)
@@ -32,8 +55,8 @@ namespace Studies.MarketResilience.Tests
                 Price = (double)a.px,
                 Size = a.sz,
                 IsBid = false,
-                LocalTimeStamp = DateTime.Now,
-                ServerTimeStamp = DateTime.Now
+                LocalTimeStamp = HelperTimeProvider.Now,
+                ServerTimeStamp = HelperTimeProvider.Now
             }).ToArray();
 
             var bidItems = bids.Select(b => new BookItem
@@ -41,8 +64,8 @@ namespace Studies.MarketResilience.Tests
                 Price = (double)b.px,
                 Size = b.sz,
                 IsBid = true,
-                LocalTimeStamp = DateTime.Now,
-                ServerTimeStamp = DateTime.Now
+                LocalTimeStamp = HelperTimeProvider.Now,
+                ServerTimeStamp = HelperTimeProvider.Now
             }).ToArray();
 
             ob.LoadData(askItems, bidItems);
@@ -51,7 +74,17 @@ namespace Studies.MarketResilience.Tests
             return snapshot;
         }
 
+        /// <summary>
+        /// Trains the depth, spread and trade baselines. Every print is the same size, so the
+        /// trade-size dispersion is zero: any larger print anchors a shock, and the trade-severity
+        /// component is omitted from every score in the tests that use this warm-up.
+        /// </summary>
         private void WarmUp(MarketResilienceWithBias calc, int frames = 300)
+        {
+            WarmUp(calc, frames, _ => 100m);
+        }
+
+        private void WarmUp(MarketResilienceWithBias calc, int frames, Func<int, decimal> printSize)
         {
             var random = new Random(42);
             for (int i = 0; i < frames; i++)
@@ -78,480 +111,396 @@ namespace Studies.MarketResilience.Tests
                 calc.OnOrderBookUpdate(lob);
                 calc.OnTrade(new Trade
                 {
-                    Size = 100,
+                    Size = printSize(i),
                     Price = 100.49m,
-                    Timestamp = DateTime.Now
+                    Timestamp = HelperTimeProvider.Now
                 });
             }
         }
 
+        // ---------- books shared by the scenarios ----------
+
+        private OrderBookSnapshot FullBook() => BuildLOB(
+            asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
+            bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) });
+
+        private OrderBookSnapshot BidDepletedBook() => BuildLOB(
+            asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
+            bids: new[] { (100.40m, 50.0), (100.39m, 30.0) });
+
+        private OrderBookSnapshot AskDepletedBook() => BuildLOB(
+            asks: new[] { (100.70m, 20.0), (100.71m, 15.0) },
+            bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) });
+
+        private OrderBookSnapshot BothDepletedBook() => BuildLOB(
+            asks: new[] { (100.60m, 20.0) },
+            bids: new[] { (100.40m, 20.0) });
+
+        private static Trade LargePrint(decimal price) => new Trade { Size = 5000, Price = price, Timestamp = HelperTimeProvider.Now };
+
         /// <summary>
-        /// Test 1: BID depletion → ASK recovery = Bearish bias (sellers regained control)
+        /// One complete depletion-and-recovery cycle: the large print, the depleted book, the
+        /// recovery <paramref name="recoveryMs"/> later. The first such cycle on a fresh
+        /// calculator seeds the recovery history; the ones after it publish a score.
+        /// </summary>
+        private void CompleteCycle(MarketResilienceWithBias calc, FixedClock clock, OrderBookSnapshot depleted, long recoveryMs, decimal printPrice = 100.49m)
+        {
+            calc.OnTrade(LargePrint(printPrice));
+            calc.OnOrderBookUpdate(depleted);
+            clock.Advance(recoveryMs);
+            calc.OnOrderBookUpdate(FullBook());
+        }
+
+        /// <summary>
+        /// Test 1: BID depletion that never redeploys = Bearish bias.
+        ///
+        /// The ask improving while the bid is still gone does NOT close the event: the untouched
+        /// side's growth is a price move, not resilience. The event closes when its window runs
+        /// out, scored as a non-recovery, and the direction points away from the bid that failed.
+        ///
+        /// Defects this catches: crediting the opposite side's growth as the recovery (the score
+        /// would move at the ask frame); discarding a timed-out event instead of scoring it (the
+        /// score would stay at the seeded 0.44 and never arm the bias); attributing the direction
+        /// to the side that grew rather than the side that failed (Bullish instead of Bearish).
         /// </summary>
         [Fact]
         public void BidDepletionAskRecovery_ShouldDetectBearishBias()
         {
-            var _settings = new PlugInSettings() { MaxShockMsTimeout = 600 }; // ✅ INCREASED timeout
-            var calc = new MarketResilienceWithBias(_settings);
-            WarmUp(calc);
-
-            // ✅ SEED fast recovery baselines (make current recovery look slow)
-            for (int i = 0; i < 5; i++)
-            {
-                calc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = DateTime.Now });
-
-                var shock = BuildLOB(
-                    asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                    bids: new[] { (100.40m, 50.0), (100.39m, 30.0) } // BID depletion
-                );
-                calc.OnOrderBookUpdate(shock);
-
-                Thread.Sleep(100); // Fast recovery
-
-                var recover = BuildLOB(
-                    asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                    bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
-                );
-                calc.OnOrderBookUpdate(recover);
-            }
-
-            // NOW run the actual test with SLOW recovery
-            // Trigger trade shock (required anchor)
-            calc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = DateTime.Now });
-
-            // BID side depletion
-            var bidDepleted = BuildLOB(
-                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                bids: new[] { (100.40m, 50.0), (100.39m, 30.0) } // Depleted
-            );
-            calc.OnOrderBookUpdate(bidDepleted);
-
-            Thread.Sleep(450); // SLOW recovery (vs 100ms baseline)
-
-            // ASK side recovers (opposite side control transfer)
-            var askRecovered = BuildLOB(
-                asks: new[] { (100.48m, 120.0), (100.49m, 120.0), (100.50m, 120.0) }, // ASK improved
-                bids: new[] { (100.40m, 50.0), (100.39m, 30.0) }  // BID still weak
-            );
-            calc.OnOrderBookUpdate(askRecovered);
-
-            // ✅ VALIDATE: Bearish bias (sellers control)
-            Assert.NotEqual(1m, calc.CurrentMRScore);
-            Assert.True(calc.CurrentMRScore <= 0.30m,
-                $"MR score {calc.CurrentMRScore} should be ≤ 0.30");
-            Assert.Equal(eMarketBias.Bearish, calc.CurrentMarketBias);
-        }
-
-        /// <summary>
-        /// Test 2: ASK depletion → BID recovery = Bullish bias (buyers regained control)
-        /// </summary>
-        [Fact]
-        public void AskDepletionBidRecovery_ShouldDetectBullishBias()
-        {
-            var _settings = new PlugInSettings() { MaxShockMsTimeout = 600 }; // ✅ INCREASED timeout
-            var calc = new MarketResilienceWithBias(_settings);
-            WarmUp(calc);
-
-            // ✅ SEED fast recovery baselines (make current recovery look slow)
-            for (int i = 0; i < 5; i++)
-            {
-                calc.OnTrade(new Trade { Size = 5000, Price = 100.50m, Timestamp = DateTime.Now });
-
-                var shock = BuildLOB(
-                    asks: new[] { (100.70m, 20.0), (100.71m, 15.0) }, // ASK depletion
-                    bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
-                );
-                calc.OnOrderBookUpdate(shock);
-
-                Thread.Sleep(100); // Fast recovery
-
-                var recover = BuildLOB(
-                    asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                    bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
-                );
-                calc.OnOrderBookUpdate(recover);
-            }
-
-            // NOW run the actual test with SLOW recovery
-            // Trigger trade shock (required anchor)
-            calc.OnTrade(new Trade { Size = 5000, Price = 100.50m, Timestamp = DateTime.Now });
-
-            // ASK side depletion
-            var askDepleted = BuildLOB(
-                asks: new[] { (100.70m, 20.0), (100.71m, 15.0) }, // Depleted
-                bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
-            );
-            calc.OnOrderBookUpdate(askDepleted);
-
-            Thread.Sleep(450); // SLOW recovery (vs 100ms baseline)
-
-            // BID side recovers (opposite side control transfer)
-            var bidRecovered = BuildLOB(
-                asks: new[] { (100.70m, 20.0), (100.71m, 15.0) },  // ASK still weak
-                bids: new[] { (100.50m, 120.0), (100.49m, 120.0), (100.48m, 120.0) } // BID improved
-            );
-            calc.OnOrderBookUpdate(bidRecovered);
-
-            // ✅ VALIDATE: Bullish bias (buyers control)
-            Assert.NotEqual(1m, calc.CurrentMRScore);
-            Assert.True(calc.CurrentMRScore <= 0.30m,
-                $"MR score {calc.CurrentMRScore} should be ≤ 0.30");
-            Assert.Equal(eMarketBias.Bullish, calc.CurrentMarketBias);
-        }
-
-        /// <summary>
-        /// Test 3: BID depletion → BID recovery (same side) = Neutral bias (resilient)
-        /// </summary>
-        [Fact]
-        public void SameSideRecovery_ShouldDetectNeutralBias()
-        {
-            var calc = new MarketResilienceWithBias(_settings);
-            WarmUp(calc);
-
-            // Trigger trade shock (required anchor)
-            calc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = DateTime.Now });
-
-            // BID side depletion
-            var bidDepleted = BuildLOB(
-                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                bids: new[] { (100.40m, 50.0), (100.39m, 30.0) } // Depleted
-            );
-            calc.OnOrderBookUpdate(bidDepleted);
-
-            Thread.Sleep(150);
-
-            // BID side recovers (same side resilience)
-            var bidRecovered = BuildLOB(
-                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) } // BID restored
-            );
-            calc.OnOrderBookUpdate(bidRecovered);
-
-            // ✅ VALIDATE: Neutral bias (resilient same-side recovery)
-            Assert.NotEqual(1m, calc.CurrentMRScore);
-            Assert.Equal(eMarketBias.Neutral, calc.CurrentMarketBias);
-        }
-
-        /// <summary>
-        /// Test 4: BOTH sides depleted → BID recovers first = Bullish bias
-        /// </summary>
-        [Fact]
-        public void BothSidesDepleted_BidRecoversFirst_ShouldDetectBullishBias()
-        {
-            var _settings = new PlugInSettings() { MaxShockMsTimeout = 600 }; // ✅ INCREASED timeout
-            var calc = new MarketResilienceWithBias(_settings);
-            WarmUp(calc);
-
-            // ✅ SEED fast recovery baselines (make current recovery look slow)
-            for (int i = 0; i < 5; i++)
-            {
-                calc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = DateTime.Now });
-
-                var shock = BuildLOB(
-                    asks: new[] { (100.60m, 20.0) }, // BOTH sides depleted
-                    bids: new[] { (100.40m, 20.0) }
-                );
-                calc.OnOrderBookUpdate(shock);
-
-                Thread.Sleep(100); // Fast recovery
-
-                var recover = BuildLOB(
-                    asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                    bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
-                );
-                calc.OnOrderBookUpdate(recover);
-            }
-
-            // NOW run the actual test with SLOW recovery
-            // Trigger trade shock (required anchor)
-            calc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = DateTime.Now });
-
-            // BOTH sides depleted
-            var bothDepleted = BuildLOB(
-                asks: new[] { (100.60m, 20.0) }, // Depleted
-                bids: new[] { (100.40m, 20.0) }  // Depleted
-            );
-            calc.OnOrderBookUpdate(bothDepleted);
-
-            Thread.Sleep(450); // SLOW recovery (vs 100ms baseline)
-
-            // BID side recovers first (buyers take control)
-            var bidRecovered = BuildLOB(
-                asks: new[] { (100.60m, 20.0) },  // ASK still weak
-                bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) } // BID strong
-            );
-            calc.OnOrderBookUpdate(bidRecovered);
-
-            // ✅ VALIDATE: Bullish bias (buyers control)
-            Assert.NotEqual(1m, calc.CurrentMRScore);
-            Assert.True(calc.CurrentMRScore <= 0.30m,
-                $"MR score {calc.CurrentMRScore} should be ≤ 0.30");
-            Assert.Equal(eMarketBias.Bullish, calc.CurrentMarketBias);
-        }
-
-        /// <summary>
-        /// Test 5: High MR score (≥0.5) should skip bias calculation and return Neutral
-        /// </summary>
-        [Fact]
-        public void HighMRScore_ShouldSkipBiasCalculation()
-        {
-            var _settings = new PlugInSettings() { MaxShockMsTimeout = 600 }; // ✅ INCREASED timeout
-            var calc = new MarketResilienceWithBias(_settings);
-            WarmUp(calc);
-
-            // ✅ SEED SLOW recovery baselines (make current fast recovery look good)
-            // This makes the 30ms recovery look FAST by comparison
-            for (int i = 0; i < 5; i++)
-            {
-                calc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = DateTime.Now });
-
-                var shock = BuildLOB(
-                    asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                    bids: new[] { (100.40m, 50.0), (100.39m, 30.0) } // BID depletion
-                );
-                calc.OnOrderBookUpdate(shock);
-
-                Thread.Sleep(400); // SLOW recovery baseline
-
-                var recover = BuildLOB(
-                    asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                    bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
-                );
-                calc.OnOrderBookUpdate(recover);
-            }
-
-            // NOW run the actual test with FAST recovery
-            // Trigger trade shock (required anchor)
-            calc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = DateTime.Now });
-
-            // BID side depletion
-            var bidDepleted = BuildLOB(
-                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                bids: new[] { (100.40m, 50.0), (100.39m, 30.0) } // Depleted
-            );
-            calc.OnOrderBookUpdate(bidDepleted);
-
-            // Very fast recovery (< 50ms) → high MR score
-            Thread.Sleep(30);
-
-            // ASK side recovers (would be bearish, but MR score should be high)
-            var askRecovered = BuildLOB(
-                asks: new[] { (100.48m, 120.0), (100.49m, 120.0), (100.50m, 120.0) }, // ASK improved
-                bids: new[] { (100.40m, 50.0), (100.39m, 30.0) }  // BID still weak
-            );
-            calc.OnOrderBookUpdate(askRecovered);
-
-            // ✅ VALIDATE: High resilience → Neutral bias (skips directional bias)
-            Assert.NotEqual(1m, calc.CurrentMRScore);
-
-            // MR score should be high (fast recovery vs 400ms baseline)
-            // depthScore = 400 / (400 + 30) ≈ 0.93 → MR ≈ 0.65-0.75 (high)
-            if (calc.CurrentMRScore >= 0.5m)
-            {
-                Assert.Equal(eMarketBias.Neutral, calc.CurrentMarketBias);
-            }
-            else
-            {
-                // If MR score is low, bias should be Bearish (ASK recovery)
-                Assert.Equal(eMarketBias.Bearish, calc.CurrentMarketBias);
-            }
-        }
-
-        /// <summary>
-        /// Test 6: Hysteresis validation - MRB arms at ≤0.30, disarms at ≥0.50, maintains state in between
-        /// This test validates the _mrbArmed state machine with MRB_ON and MRB_OFF thresholds
-        /// </summary>
-        [Fact]
-        public void HysteresisStateMachine_ShouldArmDisarmCorrectly()
-        {
+            using var clock = new FixedClock();
             var _settings = new PlugInSettings() { MaxShockMsTimeout = 600 };
             var calc = new MarketResilienceWithBias(_settings);
             WarmUp(calc);
 
-            // ═══════════════════════════════════════════════════════════════
-            // PHASE 1: ARM the hysteresis (MR ≤ 0.30)
-            // ═══════════════════════════════════════════════════════════════
-            
-            // Seed very fast baseline (50ms) to make subsequent recovery look poor
+            // Seed the recovery history with fast (100 ms) same-side recoveries. The first cycle
+            // only seeds; the rest publish a middling score that leaves the bias unarmed.
             for (int i = 0; i < 5; i++)
-            {
-                calc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = DateTime.Now });
-                var shock = BuildLOB(
-                    asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                    bids: new[] { (100.40m, 50.0), (100.39m, 30.0) }
-                );
-                calc.OnOrderBookUpdate(shock);
-                Thread.Sleep(50); // Very fast baseline
-                var recover = BuildLOB(
-                    asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                    bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
-                );
-                calc.OnOrderBookUpdate(recover);
-            }
+                CompleteCycle(calc, clock, BidDepletedBook(), recoveryMs: 100);
 
-            // Event 1: SLOW recovery (450ms) → MR ≤ 0.30 → ARMS hysteresis
-            calc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = DateTime.Now });
-            var depleted1 = BuildLOB(
-                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
+            var seededScore = calc.CurrentMRScore;
+            Assert.NotEqual(1m, seededScore);
+            Assert.Equal(eMarketBias.Neutral, calc.CurrentMarketBias);
+
+            // The event under test: the bid is taken out and never comes back.
+            calc.OnTrade(LargePrint(100.49m));
+            calc.OnOrderBookUpdate(BidDepletedBook());
+
+            clock.Advance(450);
+
+            // ASK side improves while the BID is still weak. That is not a recovery of anything.
+            var askImproved = BuildLOB(
+                asks: new[] { (100.48m, 120.0), (100.49m, 120.0), (100.50m, 120.0) },
                 bids: new[] { (100.40m, 50.0), (100.39m, 30.0) }
             );
-            calc.OnOrderBookUpdate(depleted1);
-            
-            Thread.Sleep(450); // Slow recovery: 50/(50+450) = 0.10 → MR ≈ 0.08-0.15
-            
-            var recovered1 = BuildLOB(
-                asks: new[] { (100.48m, 120.0), (100.49m, 120.0), (100.50m, 120.0) }, // ASK recovers
-                bids: new[] { (100.40m, 50.0), (100.39m, 30.0) }
-            );
-            calc.OnOrderBookUpdate(recovered1);
+            calc.OnOrderBookUpdate(askImproved);
 
-            // ✅ Validate: MR ≤ 0.30 → _mrbArmed = TRUE → Bias emitted (Bearish)
-            Assert.True(calc.CurrentMRScore <= 0.30m, 
-                $"Event 1: MR score {calc.CurrentMRScore} should be ≤ 0.30 to arm hysteresis");
+            Assert.Equal(seededScore, calc.CurrentMRScore);
+            Assert.Equal(eMarketBias.Neutral, calc.CurrentMarketBias);
+
+            // The window (600 ms) runs out with the bid still gone.
+            clock.Advance(151);
+            calc.OnOrderBookUpdate(askImproved);
+
+            Assert.NotEqual(seededScore, calc.CurrentMRScore);
+            Assert.True(calc.CurrentMRScore <= 0.30m,
+                $"MR score {calc.CurrentMRScore} should be ≤ 0.30");
             Assert.Equal(eMarketBias.Bearish, calc.CurrentMarketBias);
+        }
 
-            // ═══════════════════════════════════════════════════════════════
-            // PHASE 2: MAINTAIN armed state in middle zone (0.30 < MR < 0.50)
-            // ═══════════════════════════════════════════════════════════════
-            
-            // ✅ UPDATE BASELINE: Seed medium baseline (250ms) to make 350ms recovery appear in middle zone
-            for (int i = 0; i < 5; i++)
-            {
-                calc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = DateTime.Now });
-                var shock = BuildLOB(
-                    asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                    bids: new[] { (100.40m, 50.0), (100.39m, 30.0) }
-                );
-                calc.OnOrderBookUpdate(shock);
-                Thread.Sleep(250); // Medium baseline
-                var recover = BuildLOB(
-                    asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                    bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
-                );
-                calc.OnOrderBookUpdate(recover);
-            }
-            
-            // Event 2: Medium recovery (350ms) → MR ≈ 0.35-0.45 (middle zone)
-            // Hysteresis should STAY ARMED and continue emitting bias
-            calc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = DateTime.Now });
-            var depleted2 = BuildLOB(
-                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                bids: new[] { (100.40m, 50.0), (100.39m, 30.0) }
-            );
-            calc.OnOrderBookUpdate(depleted2);
-            
-            Thread.Sleep(350); // Medium recovery: 250/(250+350) ≈ 0.42 → MR ≈ 0.35-0.45
-            
-            var recovered2 = BuildLOB(
-                asks: new[] { (100.48m, 120.0), (100.49m, 120.0), (100.50m, 120.0) }, // ASK recovers
-                bids: new[] { (100.40m, 50.0), (100.39m, 30.0) }
-            );
-            calc.OnOrderBookUpdate(recovered2);
-
-            // ✅ Validate: MR in middle-ish zone (score well below 0.50 → not disarmed)
-            // Lower bound is intentionally loose (0.20) — Thread.Sleep jitter under parallel
-            // test execution can push score slightly below 0.30 without affecting hysteresis
-            // behavior (already-armed state stays armed for any score < 0.50).
-            Assert.InRange(calc.CurrentMRScore, 0.20m, 0.50m);
-            Assert.Equal(eMarketBias.Bearish, calc.CurrentMarketBias);
-
-            // ═══════════════════════════════════════════════════════════════
-            // PHASE 3: DISARM hysteresis (MR ≥ 0.50)
-            // ═══════════════════════════════════════════════════════════════
-
-            // ✅ RESET CALC to clear rolling windows and ensure a clean baseline for this phase
-            calc = new MarketResilienceWithBias(_settings);
+        /// <summary>
+        /// Test 2: ASK depletion that never redeploys = Bullish bias. Mirror of test 1.
+        ///
+        /// Defects this catches: the same three as test 1, on the ask side.
+        /// </summary>
+        [Fact]
+        public void AskDepletionBidRecovery_ShouldDetectBullishBias()
+        {
+            using var clock = new FixedClock();
+            var _settings = new PlugInSettings() { MaxShockMsTimeout = 600 };
+            var calc = new MarketResilienceWithBias(_settings);
             WarmUp(calc);
 
-            // ✅ UPDATE BASELINE: Seed VERY SLOW baseline (500ms) to make 1ms recovery look incredible
-            for (int i = 0; i < 10; i++)
-            {
-                calc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = DateTime.Now });
-                var shock = BuildLOB(
-                    asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                    bids: new[] { (100.40m, 50.0), (100.39m, 30.0) }
-                );
-                calc.OnOrderBookUpdate(shock);
-                Thread.Sleep(500); // VERY SLOW baseline
-                var recover = BuildLOB(
-                    asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                    bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
-                );
-                calc.OnOrderBookUpdate(recover);
-            }
-            
-            // Event 3: INSTANT recovery (1ms) → MR ≥ 0.50 → DISARMS hysteresis
-            calc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = DateTime.Now });
-            var depleted3 = BuildLOB(
-                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                bids: new[] { (100.40m, 50.0), (100.39m, 30.0) }
-            );
-            calc.OnOrderBookUpdate(depleted3);
-            
-            Thread.Sleep(1); // Instant recovery: 500/(500+1) ≈ 0.998 → depth score near perfect
-            
-            var recovered3 = BuildLOB(
-                asks: new[] { (100.48m, 120.0), (100.49m, 120.0), (100.50m, 120.0) }, // ASK recovers
-                bids: new[] { (100.40m, 50.0), (100.39m, 30.0) }
-            );
-            calc.OnOrderBookUpdate(recovered3);
+            for (int i = 0; i < 5; i++)
+                CompleteCycle(calc, clock, AskDepletedBook(), recoveryMs: 100, printPrice: 100.50m);
 
-            // ✅ Validate: MR ≥ 0.50 → _mrbArmed = FALSE → Returns to Neutral
-            // With 500ms baseline:
-            // Trade: z ≈ 0 → score = 1.0 (PERFECT!)
-            // Depth: 500/(500+1) ≈ 0.998
-            // MR = (0.3×1.0 + 0.5×0.998) / 0.8 ≈ 0.997 ≥ 0.50 ✅✅✅
+            var seededScore = calc.CurrentMRScore;
+            Assert.NotEqual(1m, seededScore);
+            Assert.Equal(eMarketBias.Neutral, calc.CurrentMarketBias);
+
+            calc.OnTrade(LargePrint(100.50m));
+            calc.OnOrderBookUpdate(AskDepletedBook());
+
+            clock.Advance(450);
+
+            // BID side improves while the ASK is still weak.
+            var bidImproved = BuildLOB(
+                asks: new[] { (100.70m, 20.0), (100.71m, 15.0) },
+                bids: new[] { (100.50m, 120.0), (100.49m, 120.0), (100.48m, 120.0) }
+            );
+            calc.OnOrderBookUpdate(bidImproved);
+
+            Assert.Equal(seededScore, calc.CurrentMRScore);
+            Assert.Equal(eMarketBias.Neutral, calc.CurrentMarketBias);
+
+            clock.Advance(151);
+            calc.OnOrderBookUpdate(bidImproved);
+
+            Assert.NotEqual(seededScore, calc.CurrentMRScore);
+            Assert.True(calc.CurrentMRScore <= 0.30m,
+                $"MR score {calc.CurrentMRScore} should be ≤ 0.30");
+            Assert.Equal(eMarketBias.Bullish, calc.CurrentMarketBias);
+        }
+
+        /// <summary>
+        /// Test 3: BID depletion → BID recovery (same side) = Neutral bias, even when the score
+        /// is poor enough to arm the bias. A slow recovery is still a recovery: the depleted
+        /// side came back, so there is no side to point away from.
+        ///
+        /// Defects this catches: a direction attributed from the depleted side alone (this would
+        /// read Bearish); a same-side refill not being credited as the recovery (the event would
+        /// stay open and the score would stay at the seeded value, above 0.30).
+        /// </summary>
+        [Fact]
+        public void SameSideRecovery_ShouldDetectNeutralBias()
+        {
+            using var clock = new FixedClock();
+            var calc = new MarketResilienceWithBias(_settings);
+            WarmUp(calc);
+
+            // Fast (50 ms) recoveries set the reference, so the 450 ms one below scores poorly.
+            for (int i = 0; i < 5; i++)
+                CompleteCycle(calc, clock, BidDepletedBook(), recoveryMs: 50);
+
+            var seededScore = calc.CurrentMRScore;
+            Assert.NotEqual(1m, seededScore);
+
+            // The event under test: the bid is taken out and comes back, slowly.
+            CompleteCycle(calc, clock, BidDepletedBook(), recoveryMs: 450);
+
+            Assert.NotEqual(seededScore, calc.CurrentMRScore);
+            Assert.True(calc.CurrentMRScore <= 0.30m,
+                $"MR score {calc.CurrentMRScore} should be ≤ 0.30 so the bias is armed");
+            Assert.Equal(eMarketBias.Neutral, calc.CurrentMarketBias);
+        }
+
+        /// <summary>
+        /// Test 4: BOTH sides depleted → only the BID comes back = Bullish bias. The event stays
+        /// open until every depleted side has redeployed or the window closes; here the ask never
+        /// does, so the event closes on the window and the direction points away from the ask.
+        ///
+        /// Defects this catches: closing the event when the first of two depleted sides returns;
+        /// forgetting which side did return when the window closes (the direction would be
+        /// Neutral, as if both had failed); a swapped direction (Bearish).
+        /// </summary>
+        [Fact]
+        public void BothSidesDepleted_BidRecoversFirst_ShouldDetectBullishBias()
+        {
+            using var clock = new FixedClock();
+            var _settings = new PlugInSettings() { MaxShockMsTimeout = 600 };
+            var calc = new MarketResilienceWithBias(_settings);
+            WarmUp(calc);
+
+            for (int i = 0; i < 5; i++)
+                CompleteCycle(calc, clock, BothDepletedBook(), recoveryMs: 100);
+
+            var seededScore = calc.CurrentMRScore;
+            Assert.NotEqual(1m, seededScore);
+            Assert.Equal(eMarketBias.Neutral, calc.CurrentMarketBias);
+
+            calc.OnTrade(LargePrint(100.49m));
+            calc.OnOrderBookUpdate(BothDepletedBook());
+
+            clock.Advance(450);
+
+            // BID side comes back; ASK side is still gone. One of two is not a recovery.
+            var bidBack = BuildLOB(
+                asks: new[] { (100.60m, 20.0) },
+                bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
+            );
+            calc.OnOrderBookUpdate(bidBack);
+
+            Assert.Equal(seededScore, calc.CurrentMRScore);
+            Assert.Equal(eMarketBias.Neutral, calc.CurrentMarketBias);
+
+            clock.Advance(151);
+            calc.OnOrderBookUpdate(bidBack);
+
+            Assert.NotEqual(seededScore, calc.CurrentMRScore);
+            Assert.True(calc.CurrentMRScore <= 0.30m,
+                $"MR score {calc.CurrentMRScore} should be ≤ 0.30");
+            Assert.Equal(eMarketBias.Bullish, calc.CurrentMarketBias);
+        }
+
+        /// <summary>
+        /// Test 5: a high MR score (≥ 0.5) silences the arrow. The bias is armed by a failed
+        /// event first, so the silence is observable as a change: Bearish → Neutral.
+        ///
+        /// Defects this catches: a fast, complete recovery not scoring as high resilience (the
+        /// recovery-time ratio inverted); the arrow keeping its direction once the book has
+        /// proven resilient.
+        /// </summary>
+        [Fact]
+        public void HighMRScore_ShouldSkipBiasCalculation()
+        {
+            using var clock = new FixedClock();
+            var _settings = new PlugInSettings() { MaxShockMsTimeout = 600 };
+            var calc = new MarketResilienceWithBias(_settings);
+            WarmUp(calc);
+
+            // A slow (400 ms) recovery seeds the reference. It publishes nothing.
+            CompleteCycle(calc, clock, BidDepletedBook(), recoveryMs: 400);
+            Assert.Equal(1m, calc.CurrentMRScore);
+
+            // Arm the bias: the bid is taken out and never comes back inside the window.
+            calc.OnTrade(LargePrint(100.49m));
+            calc.OnOrderBookUpdate(BidDepletedBook());
+            clock.Advance(601);
+            calc.OnOrderBookUpdate(BidDepletedBook());
+
+            Assert.True(calc.CurrentMRScore <= 0.30m,
+                $"MR score {calc.CurrentMRScore} should be ≤ 0.30 to arm the bias");
+            Assert.Equal(eMarketBias.Bearish, calc.CurrentMarketBias);
+
+            // A quiet frame so the next depletion is a new edge.
+            calc.OnOrderBookUpdate(FullBook());
+
+            // Very fast (30 ms) same-side recovery against the 400 ms reference → high score.
+            CompleteCycle(calc, clock, BidDepletedBook(), recoveryMs: 30);
+
             Assert.True(calc.CurrentMRScore >= 0.50m,
-                $"Event 3: MR score {calc.CurrentMRScore} should be ≥ 0.50 to disarm hysteresis");
+                $"MR score {calc.CurrentMRScore} should be ≥ 0.50 after a fast, complete recovery");
+            Assert.Equal(eMarketBias.Neutral, calc.CurrentMarketBias);
+        }
+
+        /// <summary>
+        /// Test 6: Hysteresis — the arrow arms at MR ≤ 0.30, stays armed through the middle zone
+        /// (0.30 &lt; MR &lt; 0.50), disarms at MR ≥ 0.50, and stays silent in the middle zone once
+        /// disarmed.
+        ///
+        /// An event with a failed side carries depth 0 at weight 0.50, so a middle-zone score
+        /// needs the other components near their best. This test warms up with prints of varying
+        /// size (80 / 100 / 120: mean 100, dispersion 16.33) so trade severity participates; a
+        /// 133-share print is just large enough to anchor (z ≈ 2.02 → severity 0.66) and a
+        /// 5,000-share print scores severity 0. The spread-recovery reference is seeded once with
+        /// a 400 ms return, so a return on the very next frame scores 1.0. Every failed event
+        /// widens the spread to 0.03 (magnitude ≈ 0.33) and returns it on the next frame.
+        ///
+        ///   failed side, 5,000 print ... (0 + 0.10·1.0 + 0.50·0 + 0.10·0.33) / 1.00 ≈ 0.13 → arms
+        ///   failed side,   133 print ... (0.30·0.66 + 0.10·1.0 + 0 + 0.10·0.33) / 1.00 ≈ 0.33 → middle
+        ///   30 ms recovery vs 400 ms .. (0.30·0.66 + 0.50·0.93) / 0.80 ≈ 0.83 → disarms
+        ///
+        /// Defects this catches: no direction on a poor score (phase 1); the direction not being
+        /// spoken in the middle zone while armed (phase 2 would keep the stale Bearish); the
+        /// arrow not clearing at ≥ 0.50 (phase 3); the latch not disarming, so a middle-zone
+        /// failed side speaks when it should stay silent (phase 4 would read Bullish).
+        /// </summary>
+        [Fact]
+        public void HysteresisStateMachine_ShouldArmDisarmCorrectly()
+        {
+            using var clock = new FixedClock();
+            var _settings = new PlugInSettings() { MaxShockMsTimeout = 500 };
+            var calc = new MarketResilienceWithBias(_settings);
+            WarmUp(calc, 300, i => 80m + 20m * (i % 3));
+
+            Trade Print(decimal size) => new Trade { Size = size, Price = 100.49m, Timestamp = HelperTimeProvider.Now };
+
+            // Books whose depleted side sits at its usual prices, thinned to 5 a level, with the
+            // OTHER side moved three ticks away so the spread widens to 0.03; and the same book
+            // with the other side back at half a tick, so the spread has returned.
+            var bidGoneSpreadWide = BuildLOB(
+                asks: new[] { (100.52m, 100.0), (100.53m, 100.0), (100.54m, 100.0) },
+                bids: new[] { (100.49m, 5.0), (100.48m, 5.0), (100.47m, 5.0) });
+            var bidGoneSpreadBack = BuildLOB(
+                asks: new[] { (100.495m, 100.0), (100.505m, 100.0), (100.515m, 100.0) },
+                bids: new[] { (100.49m, 5.0), (100.48m, 5.0), (100.47m, 5.0) });
+            var askGoneSpreadWide = BuildLOB(
+                asks: new[] { (100.50m, 5.0), (100.51m, 5.0), (100.52m, 5.0) },
+                bids: new[] { (100.47m, 100.0), (100.46m, 100.0), (100.45m, 100.0) });
+            var askGoneSpreadBack = BuildLOB(
+                asks: new[] { (100.50m, 5.0), (100.51m, 5.0), (100.52m, 5.0) },
+                bids: new[] { (100.495m, 100.0), (100.485m, 100.0), (100.475m, 100.0) });
+
+            // Full depth on both sides, spread 0.03 / 0.005: a spread event with no depletion.
+            var wideNoDepletion = BuildLOB(
+                asks: new[] { (100.52m, 100.0), (100.53m, 100.0), (100.54m, 100.0) },
+                bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) });
+            var tightNoDepletion = BuildLOB(
+                asks: new[] { (100.495m, 100.0), (100.505m, 100.0), (100.515m, 100.0) },
+                bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) });
+
+            var bidThinned = BuildLOB(
+                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
+                bids: new[] { (100.49m, 5.0), (100.48m, 5.0), (100.47m, 5.0) });
+
+            void FailedEvent(decimal printSize, OrderBookSnapshot wide, OrderBookSnapshot back)
+            {
+                calc.OnTrade(Print(printSize));
+                calc.OnOrderBookUpdate(wide);
+                calc.OnOrderBookUpdate(back);
+                clock.Advance(501);
+                calc.OnOrderBookUpdate(back);   // the window has run out; the side never came back
+                calc.OnOrderBookUpdate(FullBook());
+                clock.Advance(1000);
+            }
+
+            // ═══════════════════════════════════════════════════════════════
+            // PHASE 0: seed the spread-recovery reference (400 ms). Publishes nothing.
+            // ═══════════════════════════════════════════════════════════════
+            calc.OnTrade(Print(5000m));
+            calc.OnOrderBookUpdate(wideNoDepletion);
+            clock.Advance(400);
+            calc.OnOrderBookUpdate(tightNoDepletion);
+            calc.OnOrderBookUpdate(FullBook());
+            clock.Advance(1000);
+            Assert.Equal(1m, calc.CurrentMRScore);
+
+            // ═══════════════════════════════════════════════════════════════
+            // PHASE 1: ARM (MR ≤ 0.30) — the bid fails on a severe print.
+            // ═══════════════════════════════════════════════════════════════
+            FailedEvent(5000m, bidGoneSpreadWide, bidGoneSpreadBack);
+
+            Assert.True(calc.CurrentMRScore <= 0.30m,
+                $"Phase 1: MR score {calc.CurrentMRScore} should be ≤ 0.30 to arm hysteresis");
+            Assert.Equal(eMarketBias.Bearish, calc.CurrentMarketBias);
+
+            // ═══════════════════════════════════════════════════════════════
+            // PHASE 2: STAY ARMED in the middle zone — the ask fails on a mild print.
+            // ═══════════════════════════════════════════════════════════════
+            FailedEvent(133m, askGoneSpreadWide, askGoneSpreadBack);
+
+            Assert.InRange(calc.CurrentMRScore, 0.3000001m, 0.4999999m);
+            Assert.Equal(eMarketBias.Bullish, calc.CurrentMarketBias);
+
+            // ═══════════════════════════════════════════════════════════════
+            // PHASE 3: DISARM (MR ≥ 0.50) — a fast, complete recovery.
+            // ═══════════════════════════════════════════════════════════════
+
+            // Seed the depth-recovery reference with a slow (400 ms) recovery. Publishes nothing.
+            var beforeSeed = calc.CurrentMRScore;
+            calc.OnTrade(Print(5000m));
+            calc.OnOrderBookUpdate(bidThinned);
+            clock.Advance(400);
+            calc.OnOrderBookUpdate(FullBook());
+            Assert.Equal(beforeSeed, calc.CurrentMRScore);
+            Assert.Equal(eMarketBias.Bullish, calc.CurrentMarketBias);
+            clock.Advance(1000);
+
+            calc.OnTrade(Print(133m));
+            calc.OnOrderBookUpdate(bidThinned);
+            clock.Advance(30);
+            calc.OnOrderBookUpdate(FullBook());
+            clock.Advance(1000);
+
+            Assert.True(calc.CurrentMRScore >= 0.50m,
+                $"Phase 3: MR score {calc.CurrentMRScore} should be ≥ 0.50 to disarm hysteresis");
             Assert.Equal(eMarketBias.Neutral, calc.CurrentMarketBias);
 
             // ═══════════════════════════════════════════════════════════════
-            // PHASE 4: VERIFY disarmed state persists (MR in middle zone)
+            // PHASE 4: STAY DISARMED in the middle zone — the same failed-ask event as phase 2
+            // must now be spoken as nothing at all.
             // ═══════════════════════════════════════════════════════════════
-            
-            // ✅ RESET CALC again to ensure a clean baseline for this phase
-            calc = new MarketResilienceWithBias(_settings);
-            WarmUp(calc);
+            FailedEvent(133m, askGoneSpreadWide, askGoneSpreadBack);
 
-            // Re-seed the medium baseline from Phase 2
-            for (int i = 0; i < 5; i++)
-            {
-                calc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = DateTime.Now });
-                var shock = BuildLOB(
-                    asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                    bids: new[] { (100.40m, 50.0), (100.39m, 30.0) }
-                );
-                calc.OnOrderBookUpdate(shock);
-                Thread.Sleep(250); // Medium baseline
-                var recover = BuildLOB(
-                    asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                    bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
-                );
-                calc.OnOrderBookUpdate(recover);
-            }
-
-
-            // Event 4: Medium recovery (350ms) → MR ≈ 0.35-0.45 (middle zone again)
-            // Hysteresis should STAY DISARMED → No bias emitted (returns null)
-            calc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = DateTime.Now });
-            var depleted4 = BuildLOB(
-                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                bids: new[] { (100.40m, 50.0), (100.39m, 30.0) }
-            );
-            calc.OnOrderBookUpdate(depleted4);
-            
-            Thread.Sleep(350); // Same medium recovery as Event 2
-            
-            var recovered4 = BuildLOB(
-                asks: new[] { (100.48m, 120.0), (100.49m, 120.0), (100.50m, 120.0) }, // ASK recovers
-                bids: new[] { (100.40m, 50.0), (100.39m, 30.0) }
-            );
-            calc.OnOrderBookUpdate(recovered4);
-
-            // ✅ Validate: MR in middle-ish zone (score well below 0.50 BUT _mrbArmed = FALSE)
-            // Lower bound is intentionally loose (0.20) — same Thread.Sleep jitter rationale as Phase 2.
-            Assert.InRange(calc.CurrentMRScore, 0.20m, 0.50m);
-            // When hysteresis is disarmed in middle zone, bias should remain Neutral (last set value)
+            Assert.InRange(calc.CurrentMRScore, 0.3000001m, 0.4999999m);
             Assert.Equal(eMarketBias.Neutral, calc.CurrentMarketBias);
         }
     }

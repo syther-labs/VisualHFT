@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Linq;
 using System.Threading;
 using Studies.MarketResilience.Model;
@@ -14,27 +14,26 @@ namespace Studies.MarketResilience.Tests
     /// Numerical-stability contract for <see cref="MarketResilienceCalculator"/>.
     ///
     /// The calculator publishes <c>CurrentMRScore</c> as a resilience score that is documented and
-    /// consumed as a value in [0,1]. Two properties must hold for EVERY input sequence:
+    /// consumed as a value in [0,1]. Two properties must therefore hold for EVERY input sequence:
     ///   1. no public entry point (<c>OnTrade</c>, <c>OnOrderBookUpdate</c>) may throw;
     ///   2. <c>CurrentMRScore</c> must never leave [0,1].
     ///
-    /// Three arithmetic hazards sit behind those properties, and each has its own facts here:
+    /// Both are broken today by the trade-severity component:
+    ///   - the trade-size variance is accumulated as running sums and computed as
+    ///     <c>sumSq/n - avg*avg</c>. That subtraction cancels catastrophically when trade sizes are
+    ///     large and nearly identical, leaving a residual standard deviation that is many orders of
+    ///     magnitude smaller than the true one (and, with exactly-equal sizes, not zero but the
+    ///     rounding residue of the division);
     ///   - the shock trade is anchored when it is flagged as large, but its z-score is recomputed
-    ///     later against whatever the rolling window holds at trigger time. The anchored size can
-    ///     by then be far BELOW the window mean, making the z-score large and negative, so the
-    ///     trade score has to be clamped at BOTH ends, not only at zero;
-    ///   - a trade window with dispersion vanishingly small relative to its mean gives a z-score
-    ///     that carries no information, so the component must be omitted rather than scored;
-    ///   - the spread- and depth-recovery scores are <c>avgHistory / (avgHistory + duration)</c>,
-    ///     which is 0/0 = NaN when a shock and its recovery land on the same clock reading. NaN
-    ///     survives a clamp untouched, and casting it to decimal throws, so the component is
-    ///     omitted when the denominator is zero and the final cast is guarded by a finiteness
-    ///     check.
+    ///     much later against whatever the rolling window holds at trigger time. The anchored size
+    ///     can by then be far BELOW the window mean, making the z-score large and negative;
+    ///   - <c>tradeScore = Math.Max(0, 1 - z/6)</c> clamps only the lower end. A large negative z
+    ///     produces a score far above 1, which is then published verbatim.
     ///
-    /// The last group of facts are hand-computed worked examples: a normal shock and recovery, a
-    /// near-constant trade window, a zero-duration recovery against an empty history, and a cycle
-    /// in which every component is omitted (which must leave the previously published score alone
-    /// rather than invent one).
+    /// The spread- and depth-recovery components have a second, independent defect: their score is
+    /// <c>avgHistory / (avgHistory + duration)</c>, which is 0/0 = NaN the first time a shock and
+    /// its recovery land on the same clock reading — and the final cast of a NaN to decimal throws
+    /// OverflowException.
     /// </summary>
     public class MarketResilienceCalculatorNumericalStabilityTests
     {
@@ -225,12 +224,21 @@ namespace Studies.MarketResilience.Tests
             }
         }
 
-        // One zero-duration recovery must not poison the calculator. Today it does, twice over:
-        // the failed calculation never clears the shock state (the clear runs after it), so the
-        // NEXT trade walks straight back into the same divide and throws again; and the zero
-        // duration is recorded into the recovery history before the failure, so the historical
-        // average stays pinned at zero afterwards. A later, ordinary shock and recovery — with a
-        // clock that has advanced normally — must still produce a finite, in-range score.
+        // One zero-duration recovery must not poison the calculator: the shock state must be
+        // cleared afterwards, and the zero duration must NOT enter the recovery history (it
+        // would pin the historical average down for the rest of the session). Two later,
+        // ordinary cycles — with a clock that has advanced normally — must therefore behave
+        // exactly as they would on a fresh calculator: the first seeds the history and publishes
+        // nothing, the second scores against it.
+        //
+        //   trade severity .... 5,000 vs mean 200, sd 81.65 → z = 58.8 → clamped to 0   (weight 0.30)
+        //   spread recovery ... 100 ms vs a history of [100 ms] → 0.5                  (weight 0.10)
+        //   magnitude ......... spread window 30×0.5, 3×(20, 0.5) → 76.5/36 = 2.125
+        //                       score = 2.125 / 20 = 0.10625                            (weight 0.10)
+        //   score = (0 + 0.05 + 0.010625) / 0.50 = 0.12125
+        //
+        // Had the zero duration been recorded, the history would be [0, 100] and the spread
+        // recovery would score 50 / 150 = 0.333, publishing 0.0879 instead.
         [Fact]
         public void AfterAZeroDurationRecovery_ALaterNormalCycleStillProducesAnInRangeScore()
         {
@@ -249,7 +257,8 @@ namespace Studies.MarketResilience.Tests
                 // The clock moves on, as it does when the next messages carry later timestamps.
                 HelperTimeProvider.IncrementByMilliseconds(10_000);
 
-                // Second cycle: an ordinary shock with a measurable 100 ms recovery.
+                // Second cycle: an ordinary shock with a measurable 100 ms recovery. It seeds the
+                // history — the zero duration must not have — and publishes nothing.
                 var duringTrade = Record.Exception(() => calc.OnTrade(new Trade { Size = 5000m, Price = 500.25m, Timestamp = HelperTimeProvider.Now }));
                 var duringShock = Record.Exception(() => calc.OnOrderBookUpdate(Book(480m, 500m)));
                 HelperTimeProvider.IncrementByMilliseconds(100);
@@ -258,8 +267,17 @@ namespace Studies.MarketResilience.Tests
                 Assert.Null(duringTrade);
                 Assert.Null(duringShock);
                 Assert.Null(duringRecovery);
+                Assert.Equal(1m, calc.CurrentMRScore);
+
+                // Third cycle: the same shape, now measured against the seeded history.
+                HelperTimeProvider.IncrementByMilliseconds(10_000);
+                calc.OnTrade(new Trade { Size = 5000m, Price = 500.25m, Timestamp = HelperTimeProvider.Now });
+                calc.OnOrderBookUpdate(Book(480m, 500m));
+                HelperTimeProvider.IncrementByMilliseconds(100);
+                calc.OnOrderBookUpdate(Book(500m, 500.5m));
+
                 Assert.InRange(calc.CurrentMRScore, 0m, 1m);
-                Assert.NotEqual(1m, calc.CurrentMRScore);   // a score was actually produced
+                Assert.Equal(0.12125m, calc.CurrentMRScore, 6);
             }
             finally
             {
@@ -329,8 +347,13 @@ namespace Studies.MarketResilience.Tests
         // by hand from the known window contents, with the variance computed the exact (two-pass)
         // way, and the published score must match. The weights mirrored here are the ones the
         // component-weight test already asserts: trade 0.30, spread recovery 0.10, magnitude 0.10,
-        // normalised by the total weight actually used. On the FIRST recovery the historical
-        // average equals the measured duration, so the recovery term is exactly 0.5.
+        // normalised by the total weight actually used. The FIRST recovery seeds the history and
+        // publishes nothing; the SECOND, taking the same 30 ms, is measured against a history
+        // holding exactly that duration, so its recovery term is exactly 0.5.
+        //
+        // Defects this catches: the trade-size dispersion computed the cancelling one-pass way; a
+        // recovery-time ratio other than history / (history + duration); the magnitude ratio not
+        // being the plain average spread over the shock spread.
         [Fact]
         public void ShockAndRecovery_ScoreMatchesTwoPassVarianceComputedByHand()
         {
@@ -338,40 +361,59 @@ namespace Studies.MarketResilience.Tests
             const decimal shockSpread = 5m;        // bid 495 / ask 500
             const int warmUpFrames = 30;
 
-            using var calc = new MarketResilienceCalculator(Settings(5000));
-            decimal[] window = WarmUp(calc, warmUpFrames);
-
-            calc.OnTrade(new Trade { Size = shockTradeSize, Price = 500.25m, Timestamp = DateTime.Now });
-            calc.OnOrderBookUpdate(Book(495m, 500m));
-            Thread.Sleep(30);                       // keep the recovery duration strictly positive
-            calc.OnOrderBookUpdate(Book(500m, 500.5m));
-
-            // --- trade severity (weight 0.30), variance computed the exact two-pass way ---
-            decimal mean = window.Sum() / window.Length;
-            decimal sumSquaredDeviations = 0m;
-            foreach (decimal size in window)
+            HelperTimeProvider.SetFixedTime(new DateTime(2024, 3, 1, 14, 31, 0, DateTimeKind.Local));
+            try
             {
-                decimal deviation = size - mean;
-                sumSquaredDeviations += deviation * deviation;
+                using var calc = new MarketResilienceCalculator(Settings(5000));
+                decimal[] window = WarmUp(calc, warmUpFrames);
+
+                // First cycle: seeds the recovery history with 30 ms, publishes nothing.
+                calc.OnTrade(new Trade { Size = shockTradeSize, Price = 500.25m, Timestamp = HelperTimeProvider.Now });
+                calc.OnOrderBookUpdate(Book(495m, 500m));
+                HelperTimeProvider.IncrementByMilliseconds(30);
+                calc.OnOrderBookUpdate(Book(500m, 500.5m));
+                Assert.Equal(1m, calc.CurrentMRScore);
+
+                // Second cycle: the same shape, the same 30 ms.
+                HelperTimeProvider.IncrementByMilliseconds(10_000);
+                calc.OnTrade(new Trade { Size = shockTradeSize, Price = 500.25m, Timestamp = HelperTimeProvider.Now });
+                calc.OnOrderBookUpdate(Book(495m, 500m));
+                HelperTimeProvider.IncrementByMilliseconds(30);
+                calc.OnOrderBookUpdate(Book(500m, 500.5m));
+
+                // --- trade severity (weight 0.30), variance computed the exact two-pass way ---
+                // The shock prints anchor and are not added to the window, so it is still the warm-up.
+                decimal mean = window.Sum() / window.Length;
+                decimal sumSquaredDeviations = 0m;
+                foreach (decimal size in window)
+                {
+                    decimal deviation = size - mean;
+                    sumSquaredDeviations += deviation * deviation;
+                }
+                decimal variance = sumSquaredDeviations / window.Length;
+                decimal standardDeviation = (decimal)Math.Sqrt((double)variance);
+                double tradeZ = (double)((shockTradeSize - mean) / standardDeviation);
+                double tradeScore = Math.Max(0, 1.0 - (tradeZ / 6.0));
+
+                // --- spread recovery (weight 0.10): 30 ms against a history of [30 ms] ---
+                const double spreadRecoveryScore = 0.5;
+
+                // --- spread shock magnitude (weight 0.10) ---
+                // The spread history at trigger time: warm-up frames at 0.5, then two cycles of
+                // (shock, recovery).
+                decimal averageSpread = ((warmUpFrames * 0.5m) + (2 * (shockSpread + 0.5m))) / (warmUpFrames + 4);
+                double magnitudeRatio = (double)(shockSpread / averageSpread);
+                double magnitudeScore = Math.Max(0, Math.Min(1, 1.0 / magnitudeRatio));
+
+                double expected = ((0.30 * tradeScore) + (0.10 * spreadRecoveryScore) + (0.10 * magnitudeScore)) / 0.50;
+
+                Assert.InRange(tradeScore, 0.0, 1.0);   // guards the scenario: the z-score must be in the scored band
+                Assert.Equal((decimal)expected, calc.CurrentMRScore, 6);
             }
-            decimal variance = sumSquaredDeviations / window.Length;
-            decimal standardDeviation = (decimal)Math.Sqrt((double)variance);
-            double tradeZ = (double)((shockTradeSize - mean) / standardDeviation);
-            double tradeScore = Math.Max(0, 1.0 - (tradeZ / 6.0));
-
-            // --- spread recovery (weight 0.10): first recovery scores exactly 0.5 ---
-            const double spreadRecoveryScore = 0.5;
-
-            // --- spread shock magnitude (weight 0.10) ---
-            // The spread history at trigger time is: warm-up frames at 0.5, the shock, the recovery.
-            decimal averageSpread = ((warmUpFrames * 0.5m) + shockSpread + 0.5m) / (warmUpFrames + 2);
-            double magnitudeRatio = (double)(shockSpread / Math.Max(averageSpread, 0.0001m));
-            double magnitudeScore = Math.Max(0, Math.Min(1, 1.0 / magnitudeRatio));
-
-            double expected = ((0.30 * tradeScore) + (0.10 * spreadRecoveryScore) + (0.10 * magnitudeScore)) / 0.50;
-
-            Assert.InRange(tradeScore, 0.0, 1.0);   // guards the scenario: the z-score must be in the scored band
-            Assert.Equal((decimal)expected, calc.CurrentMRScore, 6);
+            finally
+            {
+                HelperTimeProvider.ResetToSystemTime();
+            }
         }
 
         // ---------------------------------------------------------------------------------
@@ -434,7 +476,7 @@ namespace Studies.MarketResilience.Tests
                 HelperTimeProvider.IncrementByMilliseconds(100);
                 calc.OnOrderBookUpdate(Book(500m, 500.5m));
 
-                decimal mrScore = calc.CurrentMRScore;
+                (decimal mrScore, _, _) = calc.GetOutputSnapshot();
                 Assert.InRange(mrScore, 0.329831441m - 0.01m, 0.329831441m + 0.01m);
             }
             finally
@@ -450,16 +492,16 @@ namespace Studies.MarketResilience.Tests
         //   trade window ...... 30 prints alternating 1,000,000 and 1,000,000.0001
         //                       mean 1,000,000.00005, population sd 0.00005
         //                       0.00005 < 1e-6 * 1,000,000.00005 = 1.00000000005 -> OMITTED
-        //   spread recovery ... empty history, 100 ms recovery
+        //   spread recovery ... history [100 ms] from the first cycle, 100 ms recovery
         //                       score = 100 / (100 + 100) = 0.5                   (weight 0.10)
-        //   magnitude ......... spread window = 30x0.5, 5, 0.5 -> mean 20.5/32 = 0.640625
-        //                       score = 0.640625 / 5 = 0.128125                   (weight 0.10)
+        //   magnitude ......... spread window = 30x0.5, 5, 0.5, 5, 0.5 -> mean 26/34 = 0.764706
+        //                       score = 0.764706 / 5 = 0.152941                   (weight 0.10)
         //   depth recovery .... no evidence -> omitted
         //
-        //   score = (0.10*0.5 + 0.10*0.128125) / 0.20 = 0.0628125 / 0.20 = 0.3140625
+        //   score = (0.10*0.5 + 0.10*0.152941) / 0.20 = 0.0652941 / 0.20 = 0.3264706
         //
-        // RED before the relative-dispersion floor (the trade component participated at weight
-        // 0.30 with a score of 0, publishing 0.1256); GREEN after.
+        // Had the trade component participated at weight 0.30 with a score of 0, the published
+        // value would be 0.0652941 / 0.50 = 0.1306 instead.
         [Fact]
         public void WorkedExample_NearConstantTradeWindow_OmitsTheTradeComponent()
         {
@@ -481,13 +523,22 @@ namespace Studies.MarketResilience.Tests
                     });
                 }
 
+                // First cycle: seeds the recovery history, publishes nothing.
+                calc.OnTrade(new Trade { Size = 1_100_000m, Price = 500.25m, Timestamp = HelperTimeProvider.Now });
+                calc.OnOrderBookUpdate(Book(495m, 500m));
+                HelperTimeProvider.IncrementByMilliseconds(100);
+                calc.OnOrderBookUpdate(Book(500m, 500.5m));
+                Assert.Equal(1m, calc.CurrentMRScore);
+
+                // Second cycle: the same shape, measured against the first.
+                HelperTimeProvider.IncrementByMilliseconds(10_000);
                 calc.OnTrade(new Trade { Size = 1_100_000m, Price = 500.25m, Timestamp = HelperTimeProvider.Now });
                 calc.OnOrderBookUpdate(Book(495m, 500m));
                 HelperTimeProvider.IncrementByMilliseconds(100);
                 calc.OnOrderBookUpdate(Book(500m, 500.5m));
 
-                decimal mrScore = calc.CurrentMRScore;
-                Assert.InRange(mrScore, 0.3140625m - 0.01m, 0.3140625m + 0.01m);
+                (decimal mrScore, _, _) = calc.GetOutputSnapshot();
+                Assert.InRange(mrScore, 0.3264706m - 0.001m, 0.3264706m + 0.001m);
             }
             finally
             {
@@ -498,21 +549,26 @@ namespace Studies.MarketResilience.Tests
         // WORKED EXAMPLE 3 - a shock and its recovery observed on the same clock reading, against
         // an empty recovery history. The recovery score would be 0/(0+0): an instantaneous
         // recovery measured against no history is an absence of evidence, so the spread-recovery
-        // component is omitted. The components that remain are trade severity (0.30) and
-        // spread-shock magnitude (0.10).
+        // component is omitted — and with no recovery component left, NOTHING is published. Trade
+        // severity and magnitude are never published on their own. The zero duration does not
+        // enter the history either, so the next cycle is the session's first real reference:
         //
+        //   cycle 1 (0 ms) .... no recovery evidence -> nothing published, score stays 1
+        //   cycle 2 (100 ms) .. seeds the history with 100 ms -> nothing published, score stays 1
+        //   cycle 3 (100 ms):
         //   trade ............. as in worked example 1 -> 0.387627564             (weight 0.30)
-        //   spread recovery ... duration 0 against an empty history -> OMITTED
-        //   magnitude ......... spread window = 30x0.5, 5, 0.5 -> mean 20.5/32 = 0.640625
-        //                       score = 0.640625 / 5 = 0.128125                   (weight 0.10)
+        //   spread recovery ... 100 ms vs [100 ms] -> 0.5                          (weight 0.10)
+        //   magnitude ......... spread window = 30x0.5, 3x(5, 0.5) -> mean 31.5/36 = 0.875
+        //                       score = 0.875 / 5 = 0.175                         (weight 0.10)
         //   depth recovery .... no evidence -> omitted
         //
-        //   score = (0.30*0.387627564 + 0.10*0.128125) / 0.40 = 0.129100769 / 0.40 = 0.322751923
+        //   score = (0.30*0.387627564 + 0.10*0.5 + 0.10*0.175) / 0.50 = 0.183788269 / 0.50
+        //         = 0.367576538
         //
-        // RED before the omission rule: the division produced NaN, the clamp propagated it and the
-        // final cast to decimal threw OverflowException. GREEN after.
+        // Had the zero duration been written to the history, cycle 2 would have published (its
+        // recovery scored against [0]) and cycle 3 would score 50/150 on recovery, 0.3342.
         [Fact]
-        public void WorkedExample_ZeroDurationRecoveryAgainstEmptyHistory_OmitsTheRecoveryComponent()
+        public void WorkedExample_ZeroDurationRecoveryAgainstEmptyHistory_PublishesNothing()
         {
             HelperTimeProvider.SetFixedTime(new DateTime(2024, 3, 1, 14, 31, 0, DateTimeKind.Local));
             try
@@ -526,8 +582,26 @@ namespace Studies.MarketResilience.Tests
                 // No clock movement between the shock and its recovery.
                 calc.OnOrderBookUpdate(Book(500m, 500.5m));
 
-                decimal mrScore = calc.CurrentMRScore;
-                Assert.InRange(mrScore, 0.322751923m - 0.01m, 0.322751923m + 0.01m);
+                Assert.Equal(1m, calc.CurrentMRScore);
+
+                // Cycle 2: seeds.
+                HelperTimeProvider.IncrementByMilliseconds(10_000);
+                calc.OnTrade(new Trade { Size = 500m, Price = 500.25m, Timestamp = HelperTimeProvider.Now });
+                calc.OnOrderBookUpdate(Book(495m, 500m));
+                HelperTimeProvider.IncrementByMilliseconds(100);
+                calc.OnOrderBookUpdate(Book(500m, 500.5m));
+
+                Assert.Equal(1m, calc.CurrentMRScore);
+
+                // Cycle 3: scores.
+                HelperTimeProvider.IncrementByMilliseconds(10_000);
+                calc.OnTrade(new Trade { Size = 500m, Price = 500.25m, Timestamp = HelperTimeProvider.Now });
+                calc.OnOrderBookUpdate(Book(495m, 500m));
+                HelperTimeProvider.IncrementByMilliseconds(100);
+                calc.OnOrderBookUpdate(Book(500m, 500.5m));
+
+                (decimal mrScore, _, _) = calc.GetOutputSnapshot();
+                Assert.InRange(mrScore, 0.367576538m - 0.001m, 0.367576538m + 0.001m);
             }
             finally
             {
@@ -558,15 +632,20 @@ namespace Studies.MarketResilience.Tests
             {
                 using var calc = new MarketResilienceCalculator(Settings(5000));
 
-                // 1. A normal spread cycle on a single-level book, which publishes a real score.
-                //    The depth detector stays cold here, so the depth history is still empty.
+                // 1. Two normal spread cycles on a single-level book: the first seeds the spread
+                //    history, the second publishes a real score. The depth detector stays cold
+                //    here, so the depth history is still empty.
                 WarmUp(calc, 30);
-                calc.OnTrade(new Trade { Size = 500m, Price = 500.25m, Timestamp = HelperTimeProvider.Now });
-                calc.OnOrderBookUpdate(Book(495m, 500m));
-                HelperTimeProvider.IncrementByMilliseconds(100);
-                calc.OnOrderBookUpdate(Book(500m, 500.5m));
+                for (int cycle = 0; cycle < 2; cycle++)
+                {
+                    calc.OnTrade(new Trade { Size = 500m, Price = 500.25m, Timestamp = HelperTimeProvider.Now });
+                    calc.OnOrderBookUpdate(Book(495m, 500m));
+                    HelperTimeProvider.IncrementByMilliseconds(100);
+                    calc.OnOrderBookUpdate(Book(500m, 500.5m));
+                    HelperTimeProvider.IncrementByMilliseconds(10_000);
+                }
 
-                decimal publishedScore = calc.CurrentMRScore;
+                (decimal publishedScore, _, _) = calc.GetOutputSnapshot();
                 Assert.InRange(publishedScore, 0m, 1m);
                 Assert.NotEqual(1m, publishedScore);    // a real score, distinguishable from the no-data value
 
@@ -596,20 +675,25 @@ namespace Studies.MarketResilience.Tests
                 calc.OnOrderBookUpdate(thinned);
                 calc.OnOrderBookUpdate(restored);
 
-                decimal afterOmittedCycle = calc.CurrentMRScore;
+                (decimal afterOmittedCycle, _, _) = calc.GetOutputSnapshot();
                 Assert.Equal(publishedScore, afterOmittedCycle);
 
-                // 4. The vacuity guard: the same cycle with a measurable recovery DOES score.
-                calc.OnTrade(new Trade { Size = 5000m, Price = 100.49m, Timestamp = HelperTimeProvider.Now });
-                calc.OnOrderBookUpdate(MultiLevelBook(
-                    asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                    bids: new[] { (100.49m, 5.0), (100.48m, 5.0), (100.47m, 5.0) }));
-                HelperTimeProvider.IncrementByMilliseconds(100);
-                calc.OnOrderBookUpdate(MultiLevelBook(
-                    asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                    bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }));
+                // 4. The vacuity guard: the same cycle with a measurable recovery DOES score. The
+                //    zero-duration cycle above did not seed the depth history, so the first
+                //    measurable cycle seeds it (still nothing published) and the second scores.
+                for (int cycle = 0; cycle < 2; cycle++)
+                {
+                    HelperTimeProvider.IncrementByMilliseconds(10_000);
+                    calc.OnTrade(new Trade { Size = 5000m, Price = 100.49m, Timestamp = HelperTimeProvider.Now });
+                    calc.OnOrderBookUpdate(thinned);
+                    HelperTimeProvider.IncrementByMilliseconds(100);
+                    calc.OnOrderBookUpdate(restored);
 
-                decimal afterScoringCycle = calc.CurrentMRScore;
+                    if (cycle == 0)
+                        Assert.Equal(publishedScore, calc.CurrentMRScore);
+                }
+
+                (decimal afterScoringCycle, _, _) = calc.GetOutputSnapshot();
                 Assert.InRange(afterScoringCycle, 0m, 1m);
                 Assert.NotEqual(publishedScore, afterScoringCycle);
             }

@@ -19,7 +19,6 @@ namespace VisualHFT.Studies
     public class MarketResilienceStudy : BasePluginStudy
     {
         private const string ValueFormat = "N1";
-        private bool _disposed = false; // to track whether the object has been disposed
         private PlugInSettings _settings;
 
 
@@ -37,32 +36,39 @@ namespace VisualHFT.Studies
 
         public override string Name { get; set; } = "Market Resilience Study";
         public override string Version { get; set; } = "1.0.0";
+        // 🛑 DO NOT EDIT THIS STRING. GetPluginUniqueID() hashes Name + Author + Version +
+        // Description + assembly name, and that hash is the key under which this tile's settings
+        // are saved and loaded. Changing a single character orphans every existing user's symbol
+        // and provider selection: the tile reloads with an empty configuration and goes dead.
+        // It also unhooks any alert rule registered against this study.
+        // Corrected, user-facing wording lives in TileToolTip below, which is not hashed.
         public override string Description { get; set; } = "Measures market recovery speed after large trades using time, spread, and depth recovery metrics. Provides real-time resilience scoring (0-1) to assess market stability and sentiment for trading decisions.";
         public override string Author { get; set; } = "VisualHFT";
         public override ISetting Settings { get => _settings; set => _settings = (PlugInSettings)value; }
         public override Action CloseSettingWindow { get; set; }
         public override string TileTitle { get; set; } = "MR";
-        public override string TileToolTip { get; set; } =
-            "<b>Market Resilience</b> (MR) is a real-time metric that quantifies how quickly a market rebounds after experiencing a large trade.<br/>" +
-            "It's an invaluable tool for traders to gauge market stability and sentiment.<br/><br/>" +
-            "The <b>MktRes</b> score is a composite index derived from three key market behaviors:<br/>" +
-            "1. <b>Time Recovery:</b> Measures the elapsed time since the large trade, normalized between 0 (immediate recovery) and 1 (close to timeout).<br/>" +
-            "2. <b>Spread Recovery:</b> Measures how quickly the gap between buying and selling prices returns to its normal state after a large trade.<br/>" +
-            "3. <b>Depth Recovery:</b> Assesses how fast the consumed levels of the Limit Order Book (LOB) are replenished post-trade.<br/><br/>" +
-            "The <b>MktRes</b> score is calculated by taking a weighted average of these three normalized metrics, ranging from 0 (no recovery) to 1 (full recovery). The score is then adjusted based on whether the market has recovered on the same side as the depletion.<br/><br/>" +
-            "<b>Resilience Strength</b><br/>" +
-            "1. <b>Strong Resilience:</b> Resilience Score ≥ 0.7<br/>" +
-            "2. <b>Moderate Resilience:</b> 0.3 ≤ Resilience Score &lt; 0.7<br/>" +
-            "3. <b>Weak Resilience:</b> Resilience Score &lt; 0.3<br/><br/>" +
-            "<b>Market Resilience Bias</b><br/>" +
-            "- If the market has a strong resilience and recovers on the same side as the depletion, it indicates a bias in the opposite direction of the recovery.<br/>" +
-            "- If the market has a weak resilience and recovers on the opposite side of the depletion, it indicates a bias in the same direction as the recovery.<br/><br/>" +
-            "<b>Quick Guidance for Traders:</b><br/>" +
-            "- Use the <b>MR</b> score to gauge the market's reaction to large trades.<br/>" +
-            "- A high score indicates a robust market that recovers quickly, ideal for entering or exiting positions.<br/>" +
-            "- A low score suggests the market is more vulnerable to large trades, so exercise caution.<br/>" +
-            "- Adjust your trading strategy based on the resilience strength: strong, moderate, or weak.<br/>" +
-            "- Pay attention to the Market Resilience Bias to understand market sentiment and potential directional moves.";
+        // The tooltip is fixed text, so it is a constant rather than an instance initializer: the
+        // tile can then read it from any instance, however that instance was created.
+        private const string TileToolTipText =
+            "<b>Market Resilience</b> (MR) measures how well the order book withstands and recovers from a large trade.<br/>" +
+            "One event = one large print (more than 2 dispersions above the recent size mean) followed by a confirmed depth depletion and/or a spread widening.<br/><br/>" +
+            "The score blends four components:<br/>" +
+            "1. <b>Trade severity (30%)</b>: how far above normal the anchoring print was.<br/>" +
+            "2. <b>Spread recovery (10%)</b>: how fast the spread returned to its mean, against this session's history.<br/>" +
+            "3. <b>Depth recovery (50%)</b>: how fast the depleted side climbed back to 90% of its pre-shock depth, against this session's history.<br/>" +
+            "4. <b>Spread magnitude (10%)</b>: how wide the shock spread was relative to the usual spread.<br/><br/>" +
+            "Only the depleted side counts as recovery. If it does not regain 90% of its depth before the Max Shock Timeout, the event is scored as a non-recovery and the depth component reads 0 at its full weight.<br/>" +
+            "The first recovery of a session is not published; it seeds the history the next one is compared to.<br/><br/>" +
+            "<b>Warm-up:</b> the depth baseline needs 200 book updates before a depletion can be detected. The tile is flagged stale until then.<br/><br/>" +
+            "<b>Reading the score.</b> It is <b>relative to this instrument's own recent behaviour</b>, not an absolute percentage. 0.7 means this recovery was faster than this book's own recent average — it does not mean 70% of the liquidity came back.<br/>" +
+            "- Strong: MR ≥ 0.7<br/>" +
+            "- Moderate: 0.3 ≤ MR &lt; 0.7<br/>" +
+            "- Weak: MR &lt; 0.3<br/><br/>" +
+            "<b>A bigger shock lowers the score.</b> Components 1 and 4 are penalties, so a book that absorbs a very large print perfectly still reads lower than one that absorbs a small print equally well. Read the number as how much stress this book is under, not only how well it bounced back.<br/><br/>" +
+            "<b>What this is inferred from.</b> Depth comes from aggregated price-level sizes, so a cancelled order cannot be told apart from a filled one, and the reading depends on how many levels your venue publishes.<br/><br/>" +
+            "The score persists until the next event replaces it.";
+        private string _tileToolTip;
+        public override string TileToolTip { get => _tileToolTip ?? TileToolTipText; set => _tileToolTip = value; }
 
         public MarketResilienceStudy()
         {
@@ -123,15 +129,27 @@ namespace VisualHFT.Studies
         }
         private void TRADE_OnDataReceived(Trade e)
         {
+            if (e == null)
+                return;
+            if (_settings.Provider.ProviderID != e.ProviderId || _settings.Symbol != e.Symbol)
+                return;
+
             mrCalc.OnTrade(e);
             DoCalculationAndSend();
         }
         private void QUEUE_onRead(OrderBookSnapshot e)
         {
-            mrCalc.OnOrderBookUpdate(e);
-            DoCalculationAndSend();
-            // ✅ CHANGED: Dispose snapshot to return arrays to pool
-            e.Dispose();
+            try
+            {
+                mrCalc.OnOrderBookUpdate(e);
+                DoCalculationAndSend();
+            }
+            finally
+            {
+                // The calculator keeps no reference to this snapshot, so the pooled arrays are
+                // returned here, on every path.
+                e.Dispose();
+            }
         }
         private void QUEUE_onError(Exception ex)
         {
@@ -156,11 +174,20 @@ namespace VisualHFT.Studies
         /// <param name="lastItemAggregationCount">Counter indicating how many times the last item has been aggregated.</param>
         protected override void onDataAggregation(List<BaseStudyModel> dataCollection, BaseStudyModel newItem, int lastItemAggregationCount)
         {
-            //we want to average the aggregations
+            // Aggregation: last.
+            // The score changes only when an event completes, and is republished unchanged on every
+            // book update and every trade in between. Averaging within the bucket therefore weights
+            // the result by message rate rather than by time: the same score sitting through a busy
+            // period is counted hundreds of times, and once in a quiet one. Two users watching the
+            // same market on venues with different update rates would read different numbers. The
+            // last value in the bucket is the score as it actually stood.
             var existing = dataCollection[^1]; // Get the last item in the collection
-            existing.Value = ((existing.Value * (lastItemAggregationCount - 1)) + newItem.Value) / lastItemAggregationCount;
+            existing.Value = newItem.Value;
             existing.Format = ValueFormat;
             existing.MarketMidPrice = newItem.MarketMidPrice;
+            existing.IsStale = newItem.IsStale;
+            existing.Tooltip = newItem.Tooltip;
+            existing.ValueColor = newItem.ValueColor;
 
             base.onDataAggregation(dataCollection, newItem, lastItemAggregationCount);
         }
@@ -169,38 +196,50 @@ namespace VisualHFT.Studies
         {
             if (Status != VisualHFT.PluginManager.ePluginStatus.STARTED) return;
 
-            // Trigger any events or updates based on the new T2O ratio
+            // Thread-safe read: snapshot all output values under lock
+            var (mrScore, _, midPrice) = mrCalc.GetOutputSnapshot();
+
             var newItem = new BaseStudyModel
             {
-                Value = mrCalc.CurrentMRScore,
+                Value = mrScore,
                 Format = ValueFormat,
-                MarketMidPrice = (decimal)mrCalc.MidMarketPrice,
+                MarketMidPrice = midPrice,
                 Timestamp = HelperTimeProvider.Now
             };
+
+            // Until the depth baseline is warm no depletion can be detected, so the score is the
+            // cold-start default rather than a measurement. Flag it the same way the platform
+            // flags a provider that stopped sending data.
+            if (!mrCalc.IsBaselineWarm)
+            {
+                newItem.IsStale = true;
+                newItem.ValueColor = "Orange";
+                newItem.Tooltip = "Warming up: " + mrCalc.WarmUpProgress + " of " +
+                                  MarketResilienceCalculator.WarmUpSamplesRequired + " book updates";
+            }
 
             AddCalculation(newItem);
         }
 
 
 
-        protected virtual void Dispose(bool disposing)
+        protected override void Dispose(bool disposing)
         {
             if (!_disposed)
             {
                 _disposed = true;
                 if (disposing)
                 {
+                    // Stop queue FIRST to prevent new items arriving after disposal
+                    _QUEUE.Dispose();
+
                     HelperOrderBook.Instance.Unsubscribe(LIMITORDERBOOK_OnDataReceived);
                     HelperTrade.Instance.Unsubscribe(TRADE_OnDataReceived);
-                    // ❌ REMOVED: OrderBookSnapshotPool no longer exists
-                    // OrderBookSnapshotPool.Instance.Dispose();
 
-                    _QUEUE.Dispose();
                     mrCalc.Dispose();
-
-                    base.Dispose();
                 }
 
+                base.Dispose(disposing);
             }
         }
         protected override void LoadSettings()
