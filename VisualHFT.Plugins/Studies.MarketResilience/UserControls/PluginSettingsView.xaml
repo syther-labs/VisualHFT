@@ -27,7 +27,7 @@
                   FontSize="18"/>
 
 
-            <Label Content="Max Shock Timeout (millisecons)" 
+            <Label Content="Max Shock Timeout (milliseconds)" 
                 ToolTip="Maximum time window (ms) to measure market resilience after detecting a shock event (large trade, spread spike, or liquidity drop). If recovery doesn't complete within this timeout, the event is abandoned and no score is calculated."/>
             <TextBox Text="{Binding MaxShockMsTimeout}" FontSize="18" Margin="0,5" />
 

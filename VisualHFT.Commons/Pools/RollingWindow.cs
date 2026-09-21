@@ -18,6 +18,20 @@ namespace VisualHFT.Commons.Pools
                 _queue.Dequeue();
         }
 
+        /// <summary>
+        /// Adds an item and returns the evicted item if the window was at capacity.
+        /// </summary>
+        /// <param name="item">Item to add</param>
+        /// <param name="evicted">The item that was evicted, if any</param>
+        /// <returns>True if an item was evicted</returns>
+        public bool AddWithEviction(T item, out T evicted)
+        {
+            bool willEvict = _queue.Count >= _maxSize;
+            evicted = willEvict ? _queue.Dequeue() : default!;
+            _queue.Enqueue(item);
+            return willEvict;
+        }
+
         public IEnumerable<T> Items => _queue;
 
         public int Count => _queue.Count;

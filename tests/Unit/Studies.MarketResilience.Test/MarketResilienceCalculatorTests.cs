@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Linq;
 using System.Threading;
+using VisualHFT;
 using VisualHFT.Model;
 using Studies.MarketResilience.Model;
 using VisualHFT.Commons.Model;
@@ -12,8 +13,19 @@ using Xunit;
 
 namespace Studies.MarketResilience.Tests
 {
+    /// <summary>
+    /// Scoring rules these tests assert:
+    ///   * the first scored recovery of a session seeds the recovery history and publishes
+    ///     nothing: a recovery with no history has nothing to be compared to;
+    ///   * only the DEPLETED side redeploying counts as a depth recovery;
+    ///   * a component whose window runs out is scored as a non-recovery (0 at its full weight),
+    ///     not discarded.
+    /// Recovery durations are driven through the shared time provider so they are exact.
+    /// </summary>
     public class MarketResilienceTests
     {
+        private static readonly DateTime ClockStart = new DateTime(2024, 3, 1, 14, 31, 0, DateTimeKind.Local);
+
         private PlugInSettings _settings;
         public MarketResilienceTests()
         {
@@ -22,6 +34,15 @@ namespace Studies.MarketResilience.Tests
                 MaxShockMsTimeout = 500
             };
         }
+
+        /// <summary>Pins the shared time provider; disposing restores wall time.</summary>
+        private sealed class FixedClock : IDisposable
+        {
+            public FixedClock() => HelperTimeProvider.SetFixedTime(ClockStart);
+            public void Advance(long milliseconds) => HelperTimeProvider.IncrementByMilliseconds(milliseconds);
+            public void Dispose() => HelperTimeProvider.ResetToSystemTime();
+        }
+
         private OrderBookSnapshot CreateOrderBook(decimal spread, decimal bidPrice, decimal askPrice)
         {
             var ob = new OrderBook();
@@ -104,226 +125,332 @@ namespace Studies.MarketResilience.Tests
             }
         }
 
+        /// <summary>
+        /// The first shock/recovery cycle of a session seeds the recovery history and publishes
+        /// nothing; the second, measured against it, publishes a score.
+        ///
+        /// Defects this catches: a stand-in published on the first recovery (the score would move
+        /// after cycle 1); the second recovery not being scored (the score would still read 1).
+        /// </summary>
         [Fact]
         public void MarketResilienceCalculator_ShouldTrigger_AfterShockAndRecovery()
         {
+            using var clock = new FixedClock();
             var mrCalc = new MarketResilienceCalculator(_settings);
 
             // Feed historical stable data
             for (int i = 0; i < 30; i++)
             {
                 mrCalc.OnOrderBookUpdate(CreateOrderBook(0.5m, 500, 500.5m));
-                mrCalc.OnTrade(new Trade { Size = 10, Price = 500.25m, Timestamp = DateTime.Now });
+                mrCalc.OnTrade(new Trade { Size = 10, Price = 500.25m, Timestamp = HelperTimeProvider.Now });
             }
 
-            // Trigger shocks explicitly
-            mrCalc.OnTrade(new Trade { Size = 5000, Price = 500, Timestamp = DateTime.Now });
+            // First cycle: shock, recovery 400 ms later. Seeds the history, publishes nothing.
+            mrCalc.OnTrade(new Trade { Size = 5000, Price = 500, Timestamp = HelperTimeProvider.Now });
             mrCalc.OnOrderBookUpdate(CreateOrderBook(5m, 495, 500));
+            clock.Advance(_settings.MaxShockMsTimeout.Value - 100);
+            mrCalc.OnOrderBookUpdate(CreateOrderBook(0.5m, 500, 500.5m));
 
-            Thread.Sleep(_settings.MaxShockMsTimeout.Value - 100); // Simulate time passing to mimic recovery period
+            Assert.Equal(1m, mrCalc.CurrentMRScore);
 
-            // Recover spread
+            // Second cycle, the same shape, measured against the first.
+            clock.Advance(10_000);
+            mrCalc.OnTrade(new Trade { Size = 5000, Price = 500, Timestamp = HelperTimeProvider.Now });
+            mrCalc.OnOrderBookUpdate(CreateOrderBook(5m, 495, 500));
+            clock.Advance(_settings.MaxShockMsTimeout.Value - 100);
             mrCalc.OnOrderBookUpdate(CreateOrderBook(0.5m, 500, 500.5m));
 
             // Verify MR recalculation occurred
             Assert.NotEqual(1m, mrCalc.CurrentMRScore);
             Assert.InRange(mrCalc.CurrentMRScore, 0, 1);
         }
+        /// <summary>
+        /// A spread widening and a BID depletion, and the bid never comes back. The ask improving
+        /// meanwhile is not a recovery of anything; the event closes when its window runs out,
+        /// scored as a non-recovery, and the direction points away from the bid that failed.
+        ///
+        /// Defects this catches: crediting the ask's growth as the recovery (the score would move
+        /// at the ask frame); discarding a timed-out event (the score would stay at the seeded
+        /// value, above 0.30, and no direction would be spoken); a swapped direction.
+        /// </summary>
         [Fact]
         public void MarketResilienceWithBias_ShouldDetectBearishBias()
         {
+            using var clock = new FixedClock();
             var _settings = new PlugInSettings() { MaxShockMsTimeout = 600 };
             var mrCalcBias = new MarketResilienceWithBias(_settings);
             WarmUp(mrCalcBias, 300);
 
-            // ✅ SEED fast recovery baselines (make current recovery look slow)
-            // Simulate 5 prior fast recoveries (100ms each) to establish historical baseline
+            var shock = BuildLOB(
+                asks: new[] { (105.00m, 100.0), (105.01m, 100.0), (105.02m, 100.0) },
+                bids: new[] { (100.30m, 20.0), (100.29m, 15.0) }
+            );
+            var recover = BuildLOB(
+                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
+                bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
+            );
+
+            // Seed the recovery history with fast (100 ms) same-side recoveries. The first cycle
+            // only seeds; the rest publish a middling score that leaves the bias unarmed.
             for (int i = 0; i < 5; i++)
             {
-                mrCalcBias.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = DateTime.Now });
-
-                var shock = BuildLOB(
-                    asks: new[] { (105.00m, 100.0), (105.01m, 100.0), (105.02m, 100.0) },
-                    bids: new[] { (100.30m, 20.0), (100.29m, 15.0) }
-                );
+                mrCalcBias.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = HelperTimeProvider.Now });
                 mrCalcBias.OnOrderBookUpdate(shock);
-
-                Thread.Sleep(100); // Fast recovery
-
-                var recover = BuildLOB(
-                    asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                    bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
-                );
+                clock.Advance(100);
                 mrCalcBias.OnOrderBookUpdate(recover);
             }
 
-            // NOW run the actual test with SLOW recovery
-            mrCalcBias.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = DateTime.Now });
+            var seededScore = mrCalcBias.CurrentMRScore;
+            Assert.NotEqual(1m, seededScore);
+            Assert.Equal(eMarketBias.Neutral, mrCalcBias.CurrentMarketBias);
+
+            // The event under test: the spread widens, then the bid is taken out.
+            mrCalcBias.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = HelperTimeProvider.Now });
 
             var spreadShock = BuildLOB(
                 asks: new[] { (105.00m, 100.0), (105.01m, 100.0), (105.02m, 100.0) },
                 bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
             );
             mrCalcBias.OnOrderBookUpdate(spreadShock);
+            mrCalcBias.OnOrderBookUpdate(shock);
 
-            var bidDepleted = BuildLOB(
-                asks: new[] { (105.00m, 100.0), (105.01m, 100.0), (105.02m, 100.0) },
-                bids: new[] { (100.30m, 20.0), (100.29m, 15.0) }
-            );
-            mrCalcBias.OnOrderBookUpdate(bidDepleted);
+            clock.Advance(450);
 
-            Thread.Sleep(450); // SLOW recovery (vs 100ms baseline)
-
-            var spreadRecovered = BuildLOB(
-                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                bids: new[] { (100.30m, 20.0), (100.29m, 15.0) }
-            );
-            mrCalcBias.OnOrderBookUpdate(spreadRecovered);
-
-            Thread.Sleep(50);
-
-            var askRecovered = BuildLOB(
+            // The ask comes back in while the bid is still gone. Not a recovery.
+            var askImproved = BuildLOB(
                 asks: new[] { (100.48m, 120.0), (100.49m, 120.0), (100.50m, 120.0) },
                 bids: new[] { (100.30m, 20.0), (100.29m, 15.0) }
             );
-            mrCalcBias.OnOrderBookUpdate(askRecovered);
+            mrCalcBias.OnOrderBookUpdate(askImproved);
 
-            // With historical baseline of 100ms, 500ms recovery gives:
-            // depthScore = 100 / (100 + 500) = 0.167
-            // spreadScore = 100 / (100 + 450) = 0.182
-            // MR = 0.30×0.25 + 0.10×0.182 + 0.50×0.167 + 0.10×0.002 = 0.177 ≤ 0.30 ✅
+            Assert.Equal(seededScore, mrCalcBias.CurrentMRScore);
+            Assert.Equal(eMarketBias.Neutral, mrCalcBias.CurrentMarketBias);
 
+            // The window (600 ms) runs out with the bid still gone.
+            clock.Advance(151);
+            mrCalcBias.OnOrderBookUpdate(askImproved);
+
+            Assert.NotEqual(seededScore, mrCalcBias.CurrentMRScore);
             Assert.True(mrCalcBias.CurrentMRScore <= 0.30m,
                 $"MR score {mrCalcBias.CurrentMRScore} should be ≤ 0.30");
             Assert.Equal(eMarketBias.Bearish, mrCalcBias.CurrentMarketBias);
         }
 
+        /// <summary>
+        /// Mirror of the Bearish case: the ASK is taken out and never comes back; the bid
+        /// improving meanwhile is not a recovery. Defects this catches: the same three, on the
+        /// ask side.
+        /// </summary>
         [Fact]
         public void MarketResilienceWithBias_ShouldDetectBullishBias()
         {
-            var _settings = new PlugInSettings() { MaxShockMsTimeout = 600 }; // ✅ INCREASED timeout
+            using var clock = new FixedClock();
+            var _settings = new PlugInSettings() { MaxShockMsTimeout = 600 };
             var mrCalcBias = new MarketResilienceWithBias(_settings);
-
-            // ✅ Use WarmUp() to train depth baselines
             WarmUp(mrCalcBias, 300);
 
-            // ✅ SEED fast recovery baselines (make current recovery look slow)
+            var askDepleted = BuildLOB(
+                asks: new[] { (100.70m, 20.0), (100.71m, 15.0) },
+                bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
+            );
+            var recover = BuildLOB(
+                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
+                bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
+            );
+
             for (int i = 0; i < 5; i++)
             {
-                mrCalcBias.OnTrade(new Trade { Size = 5000, Price = 100.50m, Timestamp = DateTime.Now });
-
-                var shock = BuildLOB(
-                    asks: new[] { (100.70m, 20.0), (100.71m, 15.0) }, // ASK depletion
-                    bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
-                );
-                mrCalcBias.OnOrderBookUpdate(shock);
-
-                Thread.Sleep(100); // Fast recovery
-
-                var recover = BuildLOB(
-                    asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                    bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
-                );
+                mrCalcBias.OnTrade(new Trade { Size = 5000, Price = 100.50m, Timestamp = HelperTimeProvider.Now });
+                mrCalcBias.OnOrderBookUpdate(askDepleted);
+                clock.Advance(100);
                 mrCalcBias.OnOrderBookUpdate(recover);
             }
 
-            // NOW run the actual test with SLOW recovery
-            // Trigger trade shock (required anchor)
-            mrCalcBias.OnTrade(new Trade { Size = 5000, Price = 100.50m, Timestamp = DateTime.Now });
+            var seededScore = mrCalcBias.CurrentMRScore;
+            Assert.NotEqual(1m, seededScore);
+            Assert.Equal(eMarketBias.Neutral, mrCalcBias.CurrentMarketBias);
 
-            // ✅ Trigger ASK depletion (depth shock)
-            var askDepleted = BuildLOB(
-                asks: new[] { (100.70m, 20.0), (100.71m, 15.0) }, // Depleted
-                bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
-            );
+            mrCalcBias.OnTrade(new Trade { Size = 5000, Price = 100.50m, Timestamp = HelperTimeProvider.Now });
             mrCalcBias.OnOrderBookUpdate(askDepleted);
 
-            Thread.Sleep(450); // SLOW recovery (vs 100ms baseline)
+            clock.Advance(450);
 
-            // ✅ BID side recovers (opposite side control transfer)
-            var bidRecovered = BuildLOB(
-                asks: new[] { (100.70m, 20.0), (100.71m, 15.0) },  // ASK still weak
-                bids: new[] { (100.50m, 120.0), (100.49m, 120.0), (100.48m, 120.0) } // BID improved
+            // The bid comes back in while the ask is still gone. Not a recovery.
+            var bidImproved = BuildLOB(
+                asks: new[] { (100.70m, 20.0), (100.71m, 15.0) },
+                bids: new[] { (100.50m, 120.0), (100.49m, 120.0), (100.48m, 120.0) }
             );
-            mrCalcBias.OnOrderBookUpdate(bidRecovered);
+            mrCalcBias.OnOrderBookUpdate(bidImproved);
 
-            // ✅ VALIDATE: Bullish bias (buyers control)
-            Assert.NotEqual(1m, mrCalcBias.CurrentMRScore);
+            Assert.Equal(seededScore, mrCalcBias.CurrentMRScore);
+            Assert.Equal(eMarketBias.Neutral, mrCalcBias.CurrentMarketBias);
+
+            clock.Advance(151);
+            mrCalcBias.OnOrderBookUpdate(bidImproved);
+
+            Assert.NotEqual(seededScore, mrCalcBias.CurrentMRScore);
             Assert.True(mrCalcBias.CurrentMRScore <= 0.30m,
                 $"MR score {mrCalcBias.CurrentMRScore} should be ≤ 0.30");
             Assert.Equal(eMarketBias.Bullish, mrCalcBias.CurrentMarketBias);
         }
 
+        /// <summary>
+        /// The BID is taken out and comes back, slowly enough to score poorly. A poor score
+        /// arms the bias, but the depleted side redeployed, so there is no side to point away
+        /// from: Neutral.
+        ///
+        /// Defects this catches: a direction attributed from the depleted side alone (Bearish);
+        /// a same-side refill not being credited as the recovery (the event would stay open and
+        /// the score would stay at the seeded value, above 0.30).
+        /// </summary>
         [Fact]
         public void MarketResilienceWithBias_ShouldDetectNeutralBias_WhenFullyRecovered()
         {
+            using var clock = new FixedClock();
             var mrCalcBias = new MarketResilienceWithBias(_settings);
-
-            // ✅ Use WarmUp() to train depth baselines
             WarmUp(mrCalcBias, 300);
 
-            // Trigger trade shock (required anchor)
-            mrCalcBias.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = DateTime.Now });
-
-            // ✅ Trigger BID depletion (depth shock)
             var bidDepleted = BuildLOB(
                 asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                bids: new[] { (100.40m, 50.0), (100.39m, 30.0) } // Depleted
+                bids: new[] { (100.40m, 50.0), (100.39m, 30.0) }
             );
-            mrCalcBias.OnOrderBookUpdate(bidDepleted);
-
-            Thread.Sleep(250);
-
-            // ✅ BID side recovers (same-side resilience)
             var bidRecovered = BuildLOB(
                 asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) } // BID restored
+                bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
             );
+
+            // Fast (100 ms) recoveries set the reference, so the 450 ms one below scores poorly.
+            for (int i = 0; i < 5; i++)
+            {
+                mrCalcBias.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = HelperTimeProvider.Now });
+                mrCalcBias.OnOrderBookUpdate(bidDepleted);
+                clock.Advance(100);
+                mrCalcBias.OnOrderBookUpdate(bidRecovered);
+            }
+
+            var seededScore = mrCalcBias.CurrentMRScore;
+            Assert.NotEqual(1m, seededScore);
+
+            mrCalcBias.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = HelperTimeProvider.Now });
+            mrCalcBias.OnOrderBookUpdate(bidDepleted);
+            clock.Advance(450);
             mrCalcBias.OnOrderBookUpdate(bidRecovered);
 
-            // ✅ VALIDATE: Neutral bias (resilient same-side recovery)
-            Assert.NotEqual(1m, mrCalcBias.CurrentMRScore);
+            Assert.NotEqual(seededScore, mrCalcBias.CurrentMRScore);
+            Assert.True(mrCalcBias.CurrentMRScore <= 0.30m,
+                $"MR score {mrCalcBias.CurrentMRScore} should be ≤ 0.30 so the bias is armed");
             Assert.Equal(eMarketBias.Neutral, mrCalcBias.CurrentMarketBias);
         }
+        /// <summary>
+        /// Two identical cycles, each a spread shock plus a depth depletion recovering 100 ms
+        /// later. The first seeds the history; the second is measured against it, so both
+        /// recovery components score exactly 0.5 and the published score is decided by the
+        /// weights alone:
+        ///
+        ///   trade severity .... warm-up prints are all one size → no dispersion → omitted
+        ///   spread recovery ... 100 ms vs 100 ms → 0.5                              (weight 0.10)
+        ///   depth recovery .... 100 ms vs 100 ms → 0.5                              (weight 0.50)
+        ///   magnitude ......... usual spread (~0.04, two 5.0 shocks in the window) / 5.0 ≈ 0.009
+        ///                                                                             (weight 0.10)
+        ///   score = (0.10·0.5 + 0.50·0.5 + 0.10·0.009) / 0.70 ≈ 0.4298
+        ///
+        /// Defects this catches: any change to the 0.10 / 0.50 / 0.10 weights (equal weights
+        /// would give 0.417 + the magnitude term); the recovery-time ratio not being 0.5 for an
+        /// equal duration; the first cycle publishing.
+        /// </summary>
         [Fact]
         public void MRCalculation_ComponentWeights_AreCorrect()
         {
+            using var clock = new FixedClock();
             var mrCalc = new MarketResilienceCalculator(_settings);
             WarmUp(mrCalc); // 300 samples
 
-            // Scenario: All shocks present with known recovery times
-            // Trade: 5000 shares (z=4.5 → score ≈ 0.25)
-            mrCalc.OnTrade(new Trade { Size = 5000, Price = 100.49m });
-
-            // ✅ FIX: Create ACTUAL 5-unit spread shock
-            // Spread: 5x shock (baseline ~0.01), 100ms recovery (fast → score ≈ 0.67)
-            // Need: spread = 5.0 units (5x baseline of ~0.01 from WarmUp)
-            // Calculate: mid = 100.49, spread = 5.0
-            //           → bid = 100.49 - 2.5 = 97.99
-            //           → ask = 100.49 + 2.5 = 102.99
-            var spreadShock = CreateOrderBook(5m, 97.99m, 102.99m);
-            mrCalc.OnOrderBookUpdate(spreadShock);
-
-            // Depth: 100ms recovery (fast → score ≈ 0.67)
             var depthShock = BuildLOB(
                 asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
                 bids: new[] { (100.40m, 50.0), (100.39m, 30.0) }
             );
-            mrCalc.OnOrderBookUpdate(depthShock);
-
-            Thread.Sleep(100);
-
-            // Recoveries - return to baseline spread (~0.01)
             var recovery = BuildLOB(
                 asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
                 bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
             );
-            mrCalc.OnOrderBookUpdate(recovery);
 
-            // ✅ VALIDATE: Score reflects proper weighting
-            // Expected: 0.3×0.25 + 0.1×0.67 + 0.5×0.67 + 0.1×0.20 ≈ 0.50
-            decimal expectedScore = 0.50m;
-            Assert.InRange(mrCalc.CurrentMRScore, expectedScore - 0.15m, expectedScore + 0.15m);
+            void Cycle()
+            {
+                mrCalc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = HelperTimeProvider.Now });
+
+                // Spread shock: 5.0 wide against a baseline of ~0.01 (bid 97.99 / ask 102.99).
+                mrCalc.OnOrderBookUpdate(CreateOrderBook(5m, 97.99m, 102.99m));
+                mrCalc.OnOrderBookUpdate(depthShock);
+
+                clock.Advance(100);
+                mrCalc.OnOrderBookUpdate(recovery);
+            }
+
+            Cycle();
+            Assert.Equal(1m, mrCalc.CurrentMRScore);   // the first cycle seeds, publishes nothing
+
+            clock.Advance(10_000);
+            Cycle();
+
+            Assert.InRange(mrCalc.CurrentMRScore, 0.428m, 0.431m);
+        }
+
+        /// <summary>
+        /// A depth depletion whose side never comes back inside the window is scored as a
+        /// non-recovery: depth 0 at its full 0.50 weight. With the spread unchanged and the trade
+        /// component omitted (one-size warm-up prints), depth is the only component, so the
+        /// published score is exactly 0. The event state is cleared: a later cycle seeds and
+        /// then scores normally.
+        ///
+        /// Defects this catches: a timed-out event being discarded (the score would stay 1);
+        /// the window closing early (the score would move before the deadline); the timed-out
+        /// depth being omitted rather than scored 0 (nothing would be published); the state not
+        /// being cleared (the later cycles could not be anchored).
+        /// </summary>
+        [Fact]
+        public void MRCalculation_DepthTimeout_ScoresZeroAtFullWeight()
+        {
+            using var clock = new FixedClock();
+            var mrCalc = new MarketResilienceCalculator(_settings);
+            WarmUp(mrCalc);
+
+            // Same prices, a fraction of the size: an immediacy collapse with an unchanged spread.
+            var thinned = BuildLOB(
+                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
+                bids: new[] { (100.49m, 5.0), (100.48m, 5.0), (100.47m, 5.0) }
+            );
+            var restored = BuildLOB(
+                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
+                bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
+            );
+
+            mrCalc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = HelperTimeProvider.Now });
+            mrCalc.OnOrderBookUpdate(thinned);
+
+            clock.Advance(450);
+            mrCalc.OnOrderBookUpdate(thinned);
+            Assert.Equal(1m, mrCalc.CurrentMRScore);    // inside the window: still open
+
+            clock.Advance(51);
+            mrCalc.OnOrderBookUpdate(thinned);
+            Assert.Equal(0m, mrCalc.CurrentMRScore);    // the window ran out: scored, 0 at full weight
+
+            // A quiet frame so the next depletion is a new edge, then two ordinary cycles.
+            mrCalc.OnOrderBookUpdate(restored);
+            clock.Advance(10_000);
+
+            mrCalc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = HelperTimeProvider.Now });
+            mrCalc.OnOrderBookUpdate(thinned);
+            clock.Advance(100);
+            mrCalc.OnOrderBookUpdate(restored);
+            Assert.Equal(0m, mrCalc.CurrentMRScore);    // seeds the depth history, publishes nothing
+
+            clock.Advance(10_000);
+            mrCalc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = HelperTimeProvider.Now });
+            mrCalc.OnOrderBookUpdate(thinned);
+            clock.Advance(100);
+            mrCalc.OnOrderBookUpdate(restored);
+            Assert.Equal(0.5m, mrCalc.CurrentMRScore);  // 100 ms vs 100 ms, depth the only component
         }
 
         [Fact]
@@ -352,60 +479,111 @@ namespace Studies.MarketResilience.Tests
             Assert.Equal(1m, mrCalc.CurrentMRScore);
         }
 
+        /// <summary>
+        /// A spread widening that never returns inside the window is scored as a non-recovery:
+        /// spread recovery 0 at its 0.10 weight, alongside the magnitude component. The trade
+        /// component is omitted (one-size prints), and the depth detector is cold (30 frames).
+        ///
+        ///   spread recovery ... window ran out → 0                                (weight 0.10)
+        ///   magnitude ......... usual spread (30×0.5, 5, 0.5 → 0.640625) / 5 = 0.128125
+        ///                                                                          (weight 0.10)
+        ///   score = 0.10·0.128125 / 0.20 = 0.0640625
+        ///
+        /// The event state is then cleared: the next cycle seeds the history (publishing
+        /// nothing) and the one after scores 0.5 on recovery time.
+        ///
+        /// Defects this catches: a timed-out spread being discarded (the score would stay 1) or
+        /// omitted (nothing would be published); the wrong weight on it; the event state not
+        /// being cleared after the timeout.
+        /// </summary>
         [Fact]
-        public void MRCalculation_SpreadTimeout_ClearsState()
+        public void MRCalculation_SpreadTimeout_ScoresZeroAndClearsState()
         {
+            using var clock = new FixedClock();
             var mrCalc = new MarketResilienceCalculator(_settings);
 
             // Setup
             for (int i = 0; i < 30; i++)
             {
                 mrCalc.OnOrderBookUpdate(CreateOrderBook(0.5m, 500, 500.5m));
-                mrCalc.OnTrade(new Trade { Size = 10, Price = 500.25m });
+                mrCalc.OnTrade(new Trade { Size = 10, Price = 500.25m, Timestamp = HelperTimeProvider.Now });
             }
 
             // Trigger shocks
-            mrCalc.OnTrade(new Trade { Size = 5000, Price = 500 });
+            mrCalc.OnTrade(new Trade { Size = 5000, Price = 500, Timestamp = HelperTimeProvider.Now });
             mrCalc.OnOrderBookUpdate(CreateOrderBook(5m, 495, 500));
 
-            // Wait for spread timeout (500ms)
-            Thread.Sleep(550);
-
-            // Trigger another order book update
+            // The window (500 ms) runs out before the spread returns.
+            clock.Advance(501);
             mrCalc.OnOrderBookUpdate(CreateOrderBook(0.5m, 500, 500.5m));
 
-            // ✅ VALIDATE: Spread shock state cleared, no calculation
-            Assert.Equal(1m, mrCalc.CurrentMRScore);
+            Assert.Equal(0.0640625m, mrCalc.CurrentMRScore, 6);
+
+            // State cleared: a new event can be anchored. The first recovery seeds ...
+            clock.Advance(10_000);
+            mrCalc.OnTrade(new Trade { Size = 5000, Price = 500, Timestamp = HelperTimeProvider.Now });
+            mrCalc.OnOrderBookUpdate(CreateOrderBook(5m, 495, 500));
+            clock.Advance(100);
+            mrCalc.OnOrderBookUpdate(CreateOrderBook(0.5m, 500, 500.5m));
+            Assert.Equal(0.0640625m, mrCalc.CurrentMRScore, 6);
+
+            // ... and the second scores: spread recovery 100 ms vs 100 ms = 0.5, magnitude
+            // (30×0.5 + 3×(5 + 0.5) → 0.875) / 5 = 0.175 → (0.05 + 0.0175) / 0.20 = 0.3375.
+            clock.Advance(10_000);
+            mrCalc.OnTrade(new Trade { Size = 5000, Price = 500, Timestamp = HelperTimeProvider.Now });
+            mrCalc.OnOrderBookUpdate(CreateOrderBook(5m, 495, 500));
+            clock.Advance(100);
+            mrCalc.OnOrderBookUpdate(CreateOrderBook(0.5m, 500, 500.5m));
+            Assert.Equal(0.3375m, mrCalc.CurrentMRScore, 6);
         }
+
+        /// <summary>
+        /// Trade + spread shock with no depth event. The first cycle seeds the spread-recovery
+        /// history; the second, with the same 200 ms return, scores exactly 0.5 on it:
+        ///
+        ///   trade severity .... one-size prints → omitted
+        ///   spread recovery ... 200 ms vs 200 ms → 0.5                             (weight 0.10)
+        ///   magnitude ......... (30×0.5 + 2×(5 + 0.5) → 26/34) / 5 = 0.152941        (weight 0.10)
+        ///   score = (0.05 + 0.0152941) / 0.20 = 0.3264706
+        ///
+        /// Defects this catches: the first cycle publishing; the recovery ratio, the magnitude
+        /// ratio, or their weights being wrong; the omitted trade component still carrying weight.
+        /// </summary>
         [Fact]
         public void MRCalculation_SpreadOnly_NoDepth_CalculatesCorrectly()
         {
+            using var clock = new FixedClock();
             var mrCalc = new MarketResilienceCalculator(_settings);
 
             // Feed baseline
             for (int i = 0; i < 30; i++)
             {
                 mrCalc.OnOrderBookUpdate(CreateOrderBook(0.5m, 500, 500.5m));
-                mrCalc.OnTrade(new Trade { Size = 10, Price = 500.25m });
+                mrCalc.OnTrade(new Trade { Size = 10, Price = 500.25m, Timestamp = HelperTimeProvider.Now });
             }
 
-            // Trigger trade + spread (but NO depth shock)
-            mrCalc.OnTrade(new Trade { Size = 5000, Price = 500 });
+            // First cycle: trade + spread (but NO depth shock). Seeds, publishes nothing.
+            mrCalc.OnTrade(new Trade { Size = 5000, Price = 500, Timestamp = HelperTimeProvider.Now });
             mrCalc.OnOrderBookUpdate(CreateOrderBook(5m, 495, 500));
+            clock.Advance(200);
+            mrCalc.OnOrderBookUpdate(CreateOrderBook(0.5m, 500, 500.5m));
+            Assert.Equal(1m, mrCalc.CurrentMRScore);
 
-            Thread.Sleep(200);
-
+            // Second cycle, measured against the first.
+            clock.Advance(10_000);
+            mrCalc.OnTrade(new Trade { Size = 5000, Price = 500, Timestamp = HelperTimeProvider.Now });
+            mrCalc.OnOrderBookUpdate(CreateOrderBook(5m, 495, 500));
+            clock.Advance(200);
             mrCalc.OnOrderBookUpdate(CreateOrderBook(0.5m, 500, 500.5m));
 
-            // ✅ VALIDATE: Score calculated with partial data
-            // Components: Trade (30%) + Spread (10%) + Magnitude (10%) = 50% weight
-            Assert.NotEqual(1m, mrCalc.CurrentMRScore);
-            Assert.InRange(mrCalc.CurrentMRScore, 0.3m, 0.9m);
+            Assert.Equal(0.326470588m, mrCalc.CurrentMRScore, 6);
         }
     }
 
     public class DepthDepletionRecoveryTests
     {
+        private static readonly DateTime ClockStart = new DateTime(2024, 3, 1, 14, 31, 0, DateTimeKind.Local);
+
         private PlugInSettings _settings;
 
         public DepthDepletionRecoveryTests()
@@ -414,6 +592,14 @@ namespace Studies.MarketResilience.Tests
             {
                 MaxShockMsTimeout = 500
             };
+        }
+
+        /// <summary>Pins the shared time provider; disposing restores wall time.</summary>
+        private sealed class FixedClock : IDisposable
+        {
+            public FixedClock() => HelperTimeProvider.SetFixedTime(ClockStart);
+            public void Advance(long milliseconds) => HelperTimeProvider.IncrementByMilliseconds(milliseconds);
+            public void Dispose() => HelperTimeProvider.ResetToSystemTime();
         }
 
         // Test utilities
@@ -674,13 +860,19 @@ namespace Studies.MarketResilience.Tests
             Assert.Equal(eLOBSIDE.NONE, secondResult);
         }
 
+        /// <summary>
+        /// Only the DEPLETED side is measured. The ask growing while the bid is still gone is a
+        /// price move, not a recovery: the event stays open until the bid itself comes back.
+        ///
+        /// Defect this catches: the untouched side's growth being credited as the recovery, which
+        /// would close a bid depletion on the ask's first uptick.
+        /// </summary>
         [Fact]
-        public void IsLOBRecovered_OppositeSideImprovesFirst_ReportsAsk()
+        public void IsLOBRecovered_OppositeSideImprovesFirst_IsNotARecovery()
         {
             var calc = new MarketResilienceCalculator(_settings);
             WarmUp(calc);
 
-            // ✅ QUALITY FIX: Trigger BID depletion with realistic 3-level structure
             var depletedLob = BuildLOB(
                 asks: new[] {
             (100.50m, 100.0),  // Ask side normal (3 levels matching warm-up)
@@ -700,28 +892,32 @@ namespace Studies.MarketResilience.Tests
             // Activate the event
             calc.ActivateDepthEvent(depletedLob, depletionResult);
 
-            // ✅ ASK side improves significantly to FULL baseline while bids stay weak
-            // This tests the scenario where the OPPOSITE side recovers first
-            Thread.Sleep(100);
-            var recoveredLob = BuildLOB(
+            // ASK side improves well past its baseline while bids stay weak.
+            var askImprovedLob = BuildLOB(
                 asks: new[] {
             (100.49m, 110.0),  // ASK improved: 1 cent better + more size
-            (100.50m, 110.0),  // Full 3 levels restored
-            (100.51m, 110.0)   // Total immediacy exceeds baseline
+            (100.50m, 110.0),
+            (100.51m, 110.0)
                 },
                 bids: new[] {
             (100.40m, 50.0),   // Bids still weak (unchanged)
-            (100.39m, 30.0)    // Still only 2 levels
+            (100.39m, 30.0)
                 }
             );
 
-            // ✅ TEST: ASK recovery should be detected (≥90% improvement on opposite side)
-            var result = calc.IsLOBRecovered(recoveredLob);
-            Assert.Equal(eLOBSIDE.ASK, result);
+            Assert.Equal(eLOBSIDE.NONE, calc.IsLOBRecovered(askImprovedLob));
+            Assert.Equal(eLOBSIDE.NONE, calc.IsLOBRecovered(askImprovedLob));
+
+            // The bid itself comes back: that is the recovery.
+            var bidRestoredLob = BuildLOB(
+                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
+                bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
+            );
+
+            Assert.Equal(eLOBSIDE.BID, calc.IsLOBRecovered(bidRestoredLob));
 
             // Second call should return NONE (edge-triggered)
-            var secondResult = calc.IsLOBRecovered(recoveredLob);
-            Assert.Equal(eLOBSIDE.NONE, secondResult);
+            Assert.Equal(eLOBSIDE.NONE, calc.IsLOBRecovered(bidRestoredLob));
         }
 
         [Fact]
@@ -756,14 +952,14 @@ namespace Studies.MarketResilience.Tests
             Thread.Sleep(200);
             var recoveredLob = BuildLOB(
                 asks: new[] {
-            (100.50m, 100.0),  // L1: Full baseline restoration
-            (100.51m, 100.0),  // L2: Full baseline restoration
-            (100.52m, 100.0)   // L3: Full baseline restoration
+            (100.50m, 100.0),  // level 1: full baseline restoration
+            (100.51m, 100.0),  // level 2: full baseline restoration
+            (100.52m, 100.0)   // level 3: full baseline restoration
                 },
                 bids: new[] {
-            (100.49m, 100.0),  // L1: Full baseline restoration
-            (100.48m, 100.0),  // L2: Full baseline restoration
-            (100.47m, 100.0)   // L3: Full baseline restoration
+            (100.49m, 100.0),  // level 1: full baseline restoration
+            (100.48m, 100.0),  // level 2: full baseline restoration
+            (100.47m, 100.0)   // level 3: full baseline restoration
                 }
             );
 
@@ -776,33 +972,46 @@ namespace Studies.MarketResilience.Tests
         }
 
 
+        /// <summary>
+        /// A partial refill is not a recovery. The depleted bid climbs from its trough to about a
+        /// third of what it lost; the 90% target is not met, so the event stays open. There is no
+        /// timeout inside this check: the recovery window belongs to the caller, which closes the
+        /// event and scores it as a non-recovery when the window runs out.
+        ///
+        /// Defects this catches: a partial refill being reported as the recovery; a "dominant
+        /// side" fallback that reports a side which never reached the target.
+        /// </summary>
         [Fact]
-        public void IsLOBRecovered_OnTimeout_PicksDominantSide()
+        public void IsLOBRecovered_PartialRefill_IsNotARecovery()
         {
             var calc = new MarketResilienceCalculator(_settings);
             WarmUp(calc);
 
             // Trigger BID depletion
             var depletedLob = BuildLOB(
-                asks: new[] { (100.50m, 100.0) },
-                bids: new[] { (100.30m, 50.0) } // Severely depleted: from ~100.49@100 to 100.30@50
+                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
+                bids: new[] { (100.40m, 50.0), (100.39m, 30.0) }
             );
-            ActivateIfNeeded(calc, depletedLob);
+            var depletionResult = calc.IsLOBDepleted(depletedLob);
+            Assert.Equal(eLOBSIDE.BID, depletionResult);
+            calc.ActivateDepthEvent(depletedLob, depletionResult);
 
-            // Force timeout with partial recovery - bid recovers significantly more
-            Thread.Sleep(1100); // Force timeout (1000ms + buffer)
-            var partialRecoveryLob = BuildLOB(
-                asks: new[] { (100.495m, 105.0) }, // Ask: minimal improvement (100.50@100 → 100.495@105)
-                bids: new[] { (100.45m, 85.0) }    // Bid: major improvement (100.30@50 → 100.45@85)
+            // Bid improves, but only part of the way back (one level at 85 against ~136 usual).
+            var partialRefillLob = BuildLOB(
+                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
+                bids: new[] { (100.45m, 85.0) }
             );
 
-            var result = calc.IsLOBRecovered(partialRecoveryLob);
-            // Bid has much better recovery fraction, should be reported as dominant
-            Assert.Equal(eLOBSIDE.BID, result);
+            Assert.Equal(eLOBSIDE.NONE, calc.IsLOBRecovered(partialRefillLob));
+            Assert.Equal(eLOBSIDE.NONE, calc.IsLOBRecovered(partialRefillLob));
 
-            // Second call should return NONE (edge-triggered)
-            var secondResult = calc.IsLOBRecovered(partialRecoveryLob);
-            Assert.Equal(eLOBSIDE.NONE, secondResult);
+            // The full refill is the recovery.
+            var restoredLob = BuildLOB(
+                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
+                bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
+            );
+            Assert.Equal(eLOBSIDE.BID, calc.IsLOBRecovered(restoredLob));
+            Assert.Equal(eLOBSIDE.NONE, calc.IsLOBRecovered(restoredLob));
         }
 
         [Fact]
@@ -822,7 +1031,7 @@ namespace Studies.MarketResilience.Tests
                 bids: new[] {
             (100.40m, 50.0),   // Bid depleted: 9 cents worse, half size
             (100.39m, 30.0)    // Even worse
-                               // Missing L3 - only 2 levels vs baseline 3
+                               // Missing level 3 - only 2 levels vs baseline 3
                 }
             );
 
@@ -985,8 +1194,17 @@ namespace Studies.MarketResilience.Tests
             Assert.Equal(eLOBSIDE.NONE, secondRecoveryResult);
         }
 
+        /// <summary>
+        /// A book too thin to show the usual number of levels does not short-circuit into a
+        /// recovery. While it stays thin the event stays open, however many times it is asked;
+        /// it closes only when the depth actually comes back (or, at the calculator level, when
+        /// the window runs out and the event is scored as a non-recovery).
+        ///
+        /// Defect this catches: a guard on level count that reports the depleted side as
+        /// recovered when there are too few levels to measure.
+        /// </summary>
         [Fact]
-        public void InsufficientTopN_TimesOutGracefully()
+        public void InsufficientTopN_WithoutRefill_IsNotReportedAsRecovered()
         {
             var calc = new MarketResilienceCalculator(_settings);
             WarmUp(calc);
@@ -996,18 +1214,20 @@ namespace Studies.MarketResilience.Tests
                 asks: new[] { (100.60m, 20.0) }, // Single level, far from market
                 bids: new[] { (100.40m, 20.0) }  // Single level, far from market
             );
-            ActivateIfNeeded(calc, minimalLob);
+            var depletionResult = calc.IsLOBDepleted(minimalLob);
+            Assert.Equal(eLOBSIDE.BOTH, depletionResult);
+            calc.ActivateDepthEvent(minimalLob, depletionResult);
 
-            // Wait for timeout
-            Thread.Sleep(1100); // Force timeout
-            var timeoutResult = calc.IsLOBRecovered(minimalLob);
-            
-            // Must timeout and finalize with some result (not NONE)
-            Assert.NotEqual(eLOBSIDE.NONE, timeoutResult);
+            Assert.Equal(eLOBSIDE.NONE, calc.IsLOBRecovered(minimalLob));
+            Assert.Equal(eLOBSIDE.NONE, calc.IsLOBRecovered(minimalLob));
 
-            // Edge-triggered check
-            var secondTimeoutResult = calc.IsLOBRecovered(minimalLob);
-            Assert.Equal(eLOBSIDE.NONE, secondTimeoutResult);
+            // The event is still live: a full refill on both sides closes it.
+            var restoredLob = BuildLOB(
+                asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
+                bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
+            );
+            Assert.Equal(eLOBSIDE.BOTH, calc.IsLOBRecovered(restoredLob));
+            Assert.Equal(eLOBSIDE.NONE, calc.IsLOBRecovered(restoredLob));
         }
 
         [Fact]
@@ -1106,6 +1326,7 @@ namespace Studies.MarketResilience.Tests
         [Fact]
         public void MRCalculation_WithDepthShock_CalculatesCorrectly()
         {
+            using var clock = new FixedClock();
             var mrCalc = new MarketResilienceCalculator(_settings);
 
             // ✅ FIX: Warm up ALL baselines (depth, spread, AND trade)
@@ -1141,28 +1362,36 @@ namespace Studies.MarketResilience.Tests
                 });
             }
 
-            // Trigger trade shock (required anchor)
-            mrCalc.OnTrade(new Trade { Size = 5000, Price = 100.49m });
-
-            // Trigger depth depletion (but NO spread shock)
             var depletedLob = BuildLOB(
                 asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
-                bids: new[] { (100.40m, 50.0), (100.39m, 30.0) } // Depleted
+                bids: new[] { (100.40m, 50.0), (100.39m, 30.0) } // Depleted; spread 0.10 vs ~0.01 usual
             );
-            mrCalc.OnOrderBookUpdate(depletedLob);
-
-            Thread.Sleep(200);
-
-            // Depth recovery
             var recoveredLob = BuildLOB(
                 asks: new[] { (100.50m, 100.0), (100.51m, 100.0), (100.52m, 100.0) },
                 bids: new[] { (100.49m, 100.0), (100.48m, 100.0), (100.47m, 100.0) }
             );
+
+            // Two identical cycles, 200 ms recovery each. The first seeds the history and
+            // publishes nothing; the second is measured against it, so both recovery
+            // components score exactly 0.5. Trade severity is omitted (one-size prints):
+            //   (0.10·0.5 + 0.50·0.5 + 0.10·magnitude) / 0.70, magnitude = ~0.011 / 0.10 ≈ 0.11
+            //   ≈ 0.444
+            // Defects this catches: the first cycle publishing; the depth recovery ratio not
+            // being 0.5 for an equal duration; the 0.50 depth weight being wrong.
+            mrCalc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = HelperTimeProvider.Now });
+            mrCalc.OnOrderBookUpdate(depletedLob);
+            clock.Advance(200);
+            mrCalc.OnOrderBookUpdate(recoveredLob);
+            Assert.Equal(1m, mrCalc.CurrentMRScore);
+
+            clock.Advance(10_000);
+            mrCalc.OnTrade(new Trade { Size = 5000, Price = 100.49m, Timestamp = HelperTimeProvider.Now });
+            mrCalc.OnOrderBookUpdate(depletedLob);
+            clock.Advance(200);
             mrCalc.OnOrderBookUpdate(recoveredLob);
 
-            // ✅ VALIDATE: MR score calculated with depth-only data
             Assert.NotEqual(1m, mrCalc.CurrentMRScore);
-            Assert.InRange(mrCalc.CurrentMRScore, 0.3m, 0.8m);
+            Assert.InRange(mrCalc.CurrentMRScore, 0.43m, 0.46m);
         }
     }
 }
