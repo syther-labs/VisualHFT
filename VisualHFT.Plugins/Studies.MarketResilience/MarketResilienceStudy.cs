@@ -58,6 +58,7 @@ namespace VisualHFT.Studies
             "3. <b>Depth recovery (50%)</b>: how fast the depleted side climbed back to 90% of its pre-shock depth, against this session's history.<br/>" +
             "4. <b>Spread magnitude (10%)</b>: how wide the shock spread was relative to the usual spread.<br/><br/>" +
             "Only the depleted side counts as recovery. If it does not regain 90% of its depth before the Max Shock Timeout, the event is scored as a non-recovery and the depth component reads 0 at its full weight.<br/>" +
+            "<b>The price has to come back too.</b> A side counts as recovered only if its best price returns to within one typical spread of where it was quoted just before the depletion. Size that reappears further away than that is the market repricing, not the book recovering, and it is scored as a non-recovery.<br/>" +
             "The first recovery of a session is not published; it seeds the history the next one is compared to.<br/><br/>" +
             "<b>Warm-up:</b> the depth baseline needs 200 book updates before a depletion can be detected. The tile is flagged stale until then.<br/><br/>" +
             "<b>Reading the score.</b> It is <b>relative to this instrument's own recent behaviour</b>, not an absolute percentage. 0.7 means this recovery was faster than this book's own recent average — it does not mean 70% of the liquidity came back.<br/>" +

@@ -67,6 +67,13 @@ namespace Studies.MarketResilience.Model
         // ----- ACTIVE DEPTH EVENT STATE -----
         private ActiveDepthEvent? _activeDepth = null;
 
+        // The touch of the PREVIOUS book update, carried forward so the frame that detects a
+        // depletion can still see the book as it stood before it. Depth that comes back only at a
+        // worse price is not a recovery, and the price it has to come back to is the last one
+        // quoted while the side was still whole.
+        private decimal? _prevBidPrice;
+        private decimal? _prevAskPrice;
+
         private struct ActiveDepthEvent
         {
             public eLOBSIDE DepletedSide;      // which side(s) triggered depletion
@@ -76,6 +83,10 @@ namespace Studies.MarketResilience.Model
             // Baselines (at t0) and troughs (worst since t0) for each side
             public double DBaseBid, DBaseAsk;  // immediacy depth baseline per side
             public double DTroughBid, DTroughAsk;
+
+            // The touch on the frame before the depletion was detected: the price each side has to
+            // come back to. Null when no earlier frame was seen.
+            public decimal? AnchorBid, AnchorAsk;
         }
 
         // ----- CONFIG -----
@@ -228,6 +239,12 @@ namespace Studies.MarketResilience.Model
 
                 recentSpreads.Add(currentSpread);
                 _lastMidPrice = (decimal?)orderBook.MidPrice;
+
+                // Carry the outgoing touch forward before it is overwritten. The depletion below is
+                // detected on the frame that already shows the damage, so the price the side has to
+                // come back to is the one quoted on the frame before it.
+                _prevBidPrice = _lastBidPrice;
+                _prevAskPrice = _lastAskPrice;
                 _lastBidPrice = (decimal?)orderBook.Bids[0]?.Price;
                 _lastAskPrice = (decimal?)orderBook.Asks[0]?.Price;
 
@@ -657,10 +674,14 @@ namespace Studies.MarketResilience.Model
         }
         internal void ActivateDepthEvent(in OrderBookSnapshot lob, eLOBSIDE side)
         {
-            // Baselines at t0: use current robust medians if available, else current values
+            // Baselines at t0: use current robust medians if available, else current values.
+            // The cold-start fallback matches IsLOBDepleted's: this book's own spread when it has
+            // one, and only then the unit of last resort. Flooring at 1.0 regardless measured the
+            // event on a different scale than the detector that admitted it, and on an instrument
+            // quoting below 1.0 that unit is larger than the whole price.
             double spreadBase = _samplesSpread >= WARMUP_MIN_SAMPLES
                 ? _qSpreadMed.Estimate
-                : Math.Max(lob.Spread, 1.0);
+                : (lob.Spread > 0 ? lob.Spread : 1.0);
 
             double dBidNow = ImmediacyDepthBid(lob, spreadBase);
             double dAskNow = ImmediacyDepthAsk(lob, spreadBase);
@@ -673,7 +694,9 @@ namespace Studies.MarketResilience.Model
                 DBaseBid = (_samplesDepth >= WARMUP_MIN_SAMPLES ? _qBidDMed.Estimate : dBidNow),
                 DBaseAsk = (_samplesDepth >= WARMUP_MIN_SAMPLES ? _qAskDMed.Estimate : dAskNow),
                 DTroughBid = dBidNow,  // initialize troughs at current, will update downward
-                DTroughAsk = dAskNow
+                DTroughAsk = dAskNow,
+                AnchorBid = _prevBidPrice,
+                AnchorAsk = _prevAskPrice
             };
         }
 
@@ -700,9 +723,11 @@ namespace Studies.MarketResilience.Model
                 double dBidNow = ImmediacyDepthBid(lob, spreadBase);
                 if (dBidNow < ev.DTroughBid) ev.DTroughBid = dBidNow;
 
-                // Recovery is how far the side has climbed from its trough toward its baseline.
+                // Recovery is how far the side has climbed from its trough toward its baseline,
+                // and it only counts if it happened at a price the pre-event book would recognise.
                 double denomBid = Math.Max(ev.DBaseBid - ev.DTroughBid, EPS);
-                if (Clamp01((dBidNow - ev.DTroughBid) / denomBid) >= RECOVERY_TARGET)
+                if (Clamp01((dBidNow - ev.DTroughBid) / denomBid) >= RECOVERY_TARGET
+                    && IsTouchWithinAnchor(BestPrice(lob.Bids), ev.AnchorBid, ev.SBase, higherIsBetter: true))
                     ev.RecoveredSides |= eLOBSIDE.BID;
             }
 
@@ -712,7 +737,8 @@ namespace Studies.MarketResilience.Model
                 if (dAskNow < ev.DTroughAsk) ev.DTroughAsk = dAskNow;
 
                 double denomAsk = Math.Max(ev.DBaseAsk - ev.DTroughAsk, EPS);
-                if (Clamp01((dAskNow - ev.DTroughAsk) / denomAsk) >= RECOVERY_TARGET)
+                if (Clamp01((dAskNow - ev.DTroughAsk) / denomAsk) >= RECOVERY_TARGET
+                    && IsTouchWithinAnchor(BestPrice(lob.Asks), ev.AnchorAsk, ev.SBase, higherIsBetter: false))
                     ev.RecoveredSides |= eLOBSIDE.ASK;
             }
 
@@ -727,6 +753,43 @@ namespace Studies.MarketResilience.Model
             return eLOBSIDE.NONE;
         }
 
+
+        /// <summary>Best price of a side, or null when the side is empty or unpriced.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static double? BestPrice(ReadOnlySpan<BookItem> levels)
+        {
+            if (levels.Length == 0 || levels[0] == null)
+                return null;
+            return levels[0].Price;
+        }
+
+        /// <summary>
+        /// Whether a side's touch has come back to the price it was quoted at before the event.
+        /// Size returning at a worse price is not resilience: the depth is there, the price that was
+        /// quoted is gone. The literature measures recovery at the pre-event best, and the arrow
+        /// reads a side that failed to redeploy as the direction the market is likely to take.
+        ///
+        /// The tolerance is one spread baseline, inclusive, taken from the event itself. It is the
+        /// instrument's own typical distance, so it carries no tick size and no price scale: routine
+        /// requoting inside the spread still counts as a recovery, and a touch that moved further
+        /// than the instrument's own spread does not.
+        ///
+        /// Two cases skip the test and credit the recovery: no anchor (the print arrived before any
+        /// book) and no measurable spread baseline. Both mean the comparison cannot be made, and
+        /// staying silent is the safe direction for a tile that only speaks about failures.
+        /// </summary>
+        private static bool IsTouchWithinAnchor(double? touch, decimal? anchor, double tolerance, bool higherIsBetter)
+        {
+            if (anchor == null || tolerance <= EPS)
+                return true;
+            if (touch == null)
+                return false;
+
+            double limit = (double)anchor.Value;
+            return higherIsBetter
+                ? touch.Value >= limit - tolerance
+                : touch.Value <= limit + tolerance;
+        }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static double InvSquareWeight(double d) // w = 1 / (1 + d)^2

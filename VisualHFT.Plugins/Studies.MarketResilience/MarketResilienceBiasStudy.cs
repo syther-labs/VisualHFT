@@ -47,22 +47,22 @@ namespace VisualHFT.Studies
 
             "<b>How It Works:</b><br/>" +
             "1. <b>Detection:</b> Identifies large trades (≥2σ above average) that cause order book depth depletion<br/>" +
-            "2. <b>Recovery Tracking:</b> Watches whether each depleted side regains 90% of its immediacy-weighted depth before the window closes. Only the side that was depleted counts; the other side growing is a price move, not a recovery<br/>" +
+            "2. <b>Recovery Tracking:</b> Watches whether each depleted side regains 90% of its immediacy-weighted depth before the window closes, AND comes back at its price — within one typical spread of where it was quoted just before the depletion. Only the side that was depleted counts; the other side growing is a price move, not a recovery<br/>" +
             "3. <b>Bias Classification:</b> Reads direction from the side that FAILED to come back<br/><br/>" +
 
             "<b>Signal Interpretation:</b><br/>" +
             "• <b>↑ Bullish (+1):</b> The depleted ask failed to redeploy — sellers could not re-offer<br/>" +
             "• <b>↓ Bearish (-1):</b> The depleted bid failed to redeploy — buyers could not re-bid<br/>" +
-            "• <b>— Neutral (0):</b> The depleted side came back, or both sides failed together, or resilience was not poor enough (MR > 0.30)<br/><br/>" +
+            "• <b>— Neutral (0):</b> The depleted side came back at its price, or came back at a BETTER price, or both sides failed together<br/><br/>" +
 
             "<b>Activation Requirements:</b><br/>" +
             "• Large trade detected (more than 2 dispersions above the recent size mean)<br/>" +
             "• Depth depletion confirmed (3 median absolute deviations below the usual immediacy-weighted depth)<br/>" +
             "• Market Resilience (MR) score ≤ 0.30 (poor resilience)<br/>" +
-            "• A depleted side still short of 90% of its depth when the timeout window closes (default: 5 seconds)<br/><br/>" +
+            "• A depleted side still short of 90% of its depth — or back in size but not back at its price — when the timeout window closes (default: 5 seconds)<br/><br/>" +
 
             "<b>Hysteresis Behavior:</b><br/>" +
-            "MRB activates when MR ≤ 0.30 and deactivates when MR ≥ 0.50, preventing signal oscillation during moderate resilience.<br/><br/>" +
+            "MRB activates when MR ≤ 0.30 and deactivates when MR ≥ 0.50, preventing signal oscillation during moderate resilience. Between those levels the arrow keeps whatever it was last showing: while it is inactive it publishes nothing rather than resetting to Neutral, so a reading persists until resilience recovers to 0.50 or a new event replaces it.<br/><br/>" +
 
             "<b>Practical Use:</b><br/>" +
             "Use MRB to identify which side (buyers/sellers) gains control after market shocks. Persistent directional bias may indicate institutional order flow or liquidity imbalances.";
